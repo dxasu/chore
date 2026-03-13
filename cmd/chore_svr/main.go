@@ -14,10 +14,10 @@ import (
 	"chore/internal/store"
 )
 
-// 编译时可通过 -ldflags "-X main.defaultAddr=..." 覆盖
+// Override at build time with -ldflags "-X main.defaultAddr=..."
 var defaultAddr = ":2026"
 
-// parseIDs 解析 -id 参数：支持单 id、范围 2-10、空格分隔 2 5 8、混合 2 5-8 10。返回去重后的 id 列表。
+// parseIDs parses -id: single id, range 2-10, space-separated 2 5 8, or mixed 2 5-8 10. Returns deduplicated ids.
 func parseIDs(s string) ([]int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -31,7 +31,7 @@ func parseIDs(s string) ([]int64, error) {
 			start, err1 := strconv.ParseInt(strings.TrimSpace(part[:idx]), 10, 64)
 			end, err2 := strconv.ParseInt(strings.TrimSpace(part[idx+1:]), 10, 64)
 			if err1 != nil || err2 != nil || start < 1 || end < 1 || start > end {
-				return nil, fmt.Errorf("无效范围 %q，应为 起始-结束 且起始≤结束", part)
+				return nil, fmt.Errorf("invalid range %q, use start-end with start<=end", part)
 			}
 			for i := start; i <= end; i++ {
 				if !seen[i] {
@@ -42,7 +42,7 @@ func parseIDs(s string) ([]int64, error) {
 		} else {
 			id, err := strconv.ParseInt(part, 10, 64)
 			if err != nil || id < 1 {
-				return nil, fmt.Errorf("无效 id %q", part)
+				return nil, fmt.Errorf("invalid id %q", part)
 			}
 			if !seen[id] {
 				seen[id] = true
@@ -54,32 +54,36 @@ func parseIDs(s string) ([]int64, error) {
 }
 
 func main() {
-	addr := flag.String("addr", defaultAddr, "监听地址（仅服务模式）")
-	dbDir := flag.String("dbDir", "./", "sqlite 所在目录，按客户端名分库（如 abc.db）")
-	name := flag.String("n", "", "本地删除/搜索时必须指定：sqlite 库名（如 chore 即 chore.db）")
-	idArg := flag.String("id", "", "指定时：本地删除指定 id；支持范围 2-10 或空格分隔 2 5 8 或混合 2 5-8 10")
-	q := flag.String("q", "", "指定时：本地按内容搜索并打印后退出")
-	limit := flag.Int("limit", 0, "与 -q 合用：搜索最多条数；无 -q 时：显示最近 N 条（需配合 -n）")
+	addr := flag.String("addr", defaultAddr, "listen address (server mode only)")
+	dbDir := flag.String("dbDir", "./", "directory for sqlite DBs, one per client name (e.g. abc.db)")
+	name := flag.String("n", "", "required for local delete/search/update: sqlite DB name (e.g. chore -> chore.db)")
+	idArg := flag.String("id", "", "local delete by id(s); or with -title/-tags: update that id (single id only)")
+	title := flag.String("title", "", "with -id -n: set title (update mode, single id)")
+	tags := flag.String("tags", "", "with -id -n: set tags, comma-separated (update mode, single id)")
+	q := flag.String("q", "", "local search by content and print, then exit")
+	limit := flag.Int("limit", 0, "with -q: max results; without -q: show last N items (requires -n)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `chore_svr - 接收 chore 上传内容，按客户端名分库存储；也可作本地删除/搜索/列表工具
+		fmt.Fprintf(os.Stderr, `chore_svr - receive paste from chore, store per-client sqlite; or use as local delete/search/list/update tool
 
-用法:
-  启动服务（默认）   chore_svr [-addr :2026] [-dbDir ./]
-  本地删除          chore_svr -n <sqlite库名> -id <id或范围或列表>
-  本地搜索并打印    chore_svr -n <sqlite库名> -q "关键词" [-limit 20]
-  最近 N 条         chore_svr -n <sqlite库名> -limit N（无 -q 时，每条显示不超过 20 字）
+Usage:
+  Start server (default)   chore_svr [-addr :2026] [-dbDir ./]
+  Local delete             chore_svr -n <dbname> -id <id or range or list>
+  Local update             chore_svr -n <dbname> -id <single-id> [-title "x"] [-tags "a,b"]
+  Local search & print     chore_svr -n <dbname> -q "keyword" [-limit 20]
+  Last N items             chore_svr -n <dbname> -limit N (no -q; preview truncated)
 
-  -id 示例: -id 3  |  -id 2-10  |  -id 2 -id 5 -id 8
+  -id for delete: -id 3  |  -id 2-10  |  -id 2 -id 5 -id 8
 
-选项:
+Options:
 `)
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, `
-服务模式下的 API（未指定 -id/-q/-limit 时）:
-  POST /api/paste           上传内容（Body: JSON {"content":"..."} 或纯文本）
-  GET  /list /list/:name    历史列表（分页，页上有搜索框）
-  GET  /detail/:name/:id    单条详情
-  GET  /search/:name?q=...   搜索页（从列表页搜索框进入，分页）
+API when running as server (no -id/-q/-limit):
+  POST   /api/paste         upload (Body: JSON {"content":"..."} or plain text)
+  PATCH  /api/paste/:id    update title and/or tags (Body: JSON {"title":"...", "tags":["a","b"]})
+  GET    /list /list/:name history list (paginated, with search)
+  GET    /detail/:name/:id single item detail
+  GET    /search/:name?q=... search page (paginated)
 `)
 	}
 	flag.Parse()
@@ -89,35 +93,65 @@ func main() {
 
 	if strings.TrimSpace(*idArg) != "" {
 		if strings.TrimSpace(*name) == "" {
-			log.Fatal("删除时请指定 -n 指定 sqlite 库名，如 chore_svr -n chore -id 1")
+			log.Fatal("specify -n (sqlite DB name), e.g. chore_svr -n chore -id 1")
 		}
 		ids, err := parseIDs(*idArg)
 		if err != nil {
-			log.Fatalf("-id 解析失败: %v", err)
+			log.Fatalf("parse -id: %v", err)
 		}
 		if len(ids) == 0 {
-			log.Fatal("-id 未解析出有效 id，支持单 id、范围 2-10、空格分隔 2 5 8")
+			log.Fatal("-id yielded no valid ids; use single id, range 2-10, or space-separated 2 5 8")
 		}
 		dbName := store.SanitizeClientName(*name)
 		st, err := manager.GetStore(dbName)
 		if err != nil {
-			log.Fatalf("打开库 %s: %v", dbName, err)
+			log.Fatalf("open DB %s: %v", dbName, err)
+		}
+		doUpdate := strings.TrimSpace(*title) != "" || strings.TrimSpace(*tags) != ""
+		if doUpdate {
+			if len(ids) != 1 {
+				log.Fatal("for update (-title/-tags) use a single -id")
+			}
+			var titlePtr *string
+			var tagsPtr *[]string
+			if t := strings.TrimSpace(*title); t != "" {
+				titlePtr = &t
+			}
+			if t := strings.TrimSpace(*tags); t != "" {
+				list := strings.Split(t, ",")
+				for i := range list {
+					list[i] = strings.TrimSpace(list[i])
+				}
+				tagsPtr = &list
+			}
+			if titlePtr == nil && tagsPtr == nil {
+				log.Fatal("for update specify -title and/or -tags")
+			}
+			updated, err := st.Update(context.Background(), ids[0], titlePtr, tagsPtr)
+			if err != nil {
+				log.Fatalf("update id %d: %v", ids[0], err)
+			}
+			if !updated {
+				log.Fatalf("id %d not found", ids[0])
+			}
+			fmt.Printf("ok, updated id %d\n", ids[0])
+			return
 		}
 		var deleted int64
 		for _, id := range ids {
 			n, err := st.Delete(context.Background(), id)
 			if err != nil {
-				log.Fatalf("删除 id %d 失败: %v", id, err)
+				log.Fatalf("delete id %d: %v", id, err)
 			}
 			deleted += n
 		}
-		fmt.Printf("ok，已删除 %d 条\n", deleted)
+		fmt.Printf("ok, deleted %d\n", deleted)
 		return
 	}
-	const previewRunes = 100 // 每条记录内容预览最多字数
+	const previewRunes = 100
 	if *q != "" {
 		if strings.TrimSpace(*name) == "" {
-			log.Fatal("搜索时请指定 -n 指定 sqlite 库名，如 chore_svr -n chore -q \"关键词\"")
+			log.Fatal("for search, specify -n (DB name), e.g. chore_svr -n chore -q \"keyword\"")
 		}
 		dbName := store.SanitizeClientName(*name)
 		searchLimit := *limit
@@ -129,11 +163,11 @@ func main() {
 		}
 		st, err := manager.GetStore(dbName)
 		if err != nil {
-			log.Fatalf("打开库 %s: %v", dbName, err)
+			log.Fatalf("open DB %s: %v", dbName, err)
 		}
 		list, total, err := st.Search(context.Background(), *q, 0, searchLimit)
 		if err != nil {
-			log.Fatalf("搜索失败: %v", err)
+			log.Fatalf("search: %v", err)
 		}
 		for _, p := range list {
 			preview := p.Content
@@ -142,21 +176,21 @@ func main() {
 			}
 			fmt.Printf("#%d %s\n%s\n\n", p.ID, p.CreatedAt.Format("2006-01-02 15:04:05"), preview)
 		}
-		fmt.Fprintf(os.Stderr, "共 %d 条（显示最多 %d 条）\n", total, len(list))
+		fmt.Fprintf(os.Stderr, "total %d (showing up to %d)\n", total, len(list))
 		return
 	}
 	if *limit > 0 {
 		if strings.TrimSpace(*name) == "" {
-			log.Fatal("显示最近 N 条时请指定 -n，如 chore_svr -n chore -limit 10")
+			log.Fatal("for last N items, specify -n, e.g. chore_svr -n chore -limit 10")
 		}
 		dbName := store.SanitizeClientName(*name)
 		st, err := manager.GetStore(dbName)
 		if err != nil {
-			log.Fatalf("打开库 %s: %v", dbName, err)
+			log.Fatalf("open DB %s: %v", dbName, err)
 		}
 		list, total, err := st.List(context.Background(), 0, *limit)
 		if err != nil {
-			log.Fatalf("列表失败: %v", err)
+			log.Fatalf("list: %v", err)
 		}
 		for _, p := range list {
 			preview := p.Content
@@ -165,17 +199,24 @@ func main() {
 			}
 			fmt.Printf("#%d %s\n%s\n\n", p.ID, p.CreatedAt.Format("2006-01-02 15:04:05"), preview)
 		}
-		fmt.Fprintf(os.Stderr, "共 %d 条（显示最近 %d 条）\n", total, len(list))
+		fmt.Fprintf(os.Stderr, "total %d (showing last %d)\n", total, len(list))
 		return
 	}
 
+	logRequest := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			log.Printf("[%d] %s %s %s", r.ContentLength, r.URL.Path, r.RemoteAddr, r.UserAgent())
+			next(w, r)
+		}
+	}
 	h := server.New(manager)
-	http.HandleFunc("/api/paste", h.HandlePaste)
-	http.HandleFunc("/search", h.HandleSearchPage)
-	http.HandleFunc("/search/", h.HandleSearchPage)
-	http.HandleFunc("/list", h.HandleList)
-	http.HandleFunc("/list/", h.HandleList)
-	http.HandleFunc("/detail/", h.HandleDetail)
+	http.HandleFunc("/api/paste", logRequest(h.HandlePaste))
+	http.HandleFunc("/api/paste/", logRequest(h.HandlePatchPaste))
+	http.HandleFunc("/search", logRequest(h.HandleSearchPage))
+	http.HandleFunc("/search/", logRequest(h.HandleSearchPage))
+	http.HandleFunc("/list", logRequest(h.HandleList))
+	http.HandleFunc("/list/", logRequest(h.HandleList))
+	http.HandleFunc("/detail/", logRequest(h.HandleDetail))
 
 	log.Printf("chore_svr listening on %s", *addr)
 	if err := http.ListenAndServe(*addr, nil); err != nil {

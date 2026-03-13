@@ -16,18 +16,20 @@ import (
 	"github.com/atotto/clipboard"
 )
 
-// 编译时可通过 -ldflags "-X main.defaultServerURL=..." 覆盖
+// Override at build time with -ldflags "-X main.defaultServerURL=..."
 var defaultServerURL = "http://localhost:2026"
 
 func main() {
-	serverURL := flag.String("server", defaultServerURL, "chore_svr 服务地址")
-	verbose := flag.Bool("v", false, "成功时输出详情链接与历史链接")
-	openList := flag.Bool("o", false, "不发送数据，仅打开浏览器到历史列表页")
+	serverURL := flag.String("server", defaultServerURL, "chore_svr server URL")
+	verbose := flag.Bool("v", false, "on success print detail and list URLs")
+	openList := flag.Bool("o", false, "do not send; open browser to list page only")
+	title := flag.String("title", "", "optional title for the paste")
+	tags := flag.String("tags", "", "optional comma-separated tags (max 6)")
 	flag.Usage = func() {
 		name := clientNameFromExec()
-		fmt.Fprintf(os.Stderr, "%s - 将剪贴板内容发送到 chore_svr，按可执行文件名分库（如 abc -> abc.db）\n\n用法:\n  %s [选项]\n\n选项:\n", name, name)
+		fmt.Fprintf(os.Stderr, "%s - send clipboard to chore_svr, one DB per executable name (e.g. abc -> abc.db)\n\nUsage:\n  %s [options]\n\nOptions:\n", name, name)
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\n示例:\n  %s          读取剪贴板并上传，成功输出 ok\n  %s -v       上传并输出详情链接、历史链接\n  %s -o       不上传，打开浏览器到历史列表页（页内可搜索）\n  %s -server http://host:9000  指定服务地址\n", name, name, name, name)
+		fmt.Fprintf(os.Stderr, "\nExamples:\n  %s          read clipboard and upload, print ok on success\n  %s -v       print detail URL and list URL\n  %s -o       open browser to list page\n  %s -title \"Note\" -tags a,b,c  upload with optional title and tags\n  %s -server http://host:9000  use custom server\n", name, name, name, name, name)
 	}
 	flag.Parse()
 
@@ -36,39 +38,53 @@ func main() {
 	listURL := baseURL + "/list/" + clientName
 	if *openList {
 		if err := openBrowser(listURL); err != nil {
-			fail("打开浏览器失败: %v", err)
+			fail("open browser: %v", err)
 		}
-		fmt.Println("ok")
 		return
 	}
 
 	content, err := clipboard.ReadAll()
 	if err != nil {
-		fail("读取剪贴板失败: %v", err)
+		fail("read clipboard: %v", err)
 	}
 
 	content = trimSpace(content)
 	if content == "" {
-		fail("剪贴板为空")
+		fail("clipboard is empty")
 	}
 
-	body, _ := json.Marshal(map[string]string{"content": content})
+	payload := struct {
+		Content string   `json:"content"`
+		Title   string   `json:"title,omitempty"`
+		Tags    []string `json:"tags,omitempty"`
+	}{
+		Content: content,
+		Title:   strings.TrimSpace(*title),
+	}
+	if *tags != "" {
+		for _, t := range strings.Split(*tags, ",") {
+			if s := strings.TrimSpace(t); s != "" {
+				payload.Tags = append(payload.Tags, s)
+			}
+		}
+	}
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/paste", bytes.NewReader(body))
 	if err != nil {
-		fail("请求构造失败: %v", err)
+		fail("build request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Client-Name", clientName)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		fail("请求失败: %v", err)
+		fail("request: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		fail("服务器返回 %d: %s", resp.StatusCode, string(b))
+		fail("server returned %d: %s", resp.StatusCode, string(b))
 	}
 
 	var out struct {
@@ -78,21 +94,21 @@ func main() {
 		ListURL   string `json:"list_url"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		fail("解析响应失败: %v", err)
+		fail("decode response: %v", err)
 	}
 
 	if !*verbose {
 		fmt.Println("ok")
 		return
 	}
-	fmt.Printf("已保存 #%d %s\n", out.ID, out.CreatedAt)
-	fmt.Printf("详情: %s%s\n", *serverURL, out.DetailURL)
+	fmt.Printf("saved #%d %s\n", out.ID, out.CreatedAt)
+	fmt.Printf("detail: %s%s\n", *serverURL, out.DetailURL)
 	if out.ListURL != "" {
-		fmt.Printf("历史: %s%s\n", *serverURL, out.ListURL)
+		fmt.Printf("list: %s%s\n", *serverURL, out.ListURL)
 	}
 }
 
-// fail 向 stderr 输出失败原因并退出，默认模式下仅此一行
+// fail prints to stderr and exits
 func fail(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
@@ -109,7 +125,7 @@ func openBrowser(url string) error {
 	}
 }
 
-// clientNameFromExec 返回当前可执行文件名（不含路径与 .exe），用作服务端 db 名，如 abc -> abc.db
+// clientNameFromExec returns the executable base name (no path, no .exe), used as server DB name (e.g. abc -> abc.db)
 func clientNameFromExec() string {
 	name := os.Args[0]
 	if name != "" {
