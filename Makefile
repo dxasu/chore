@@ -25,6 +25,3 @@ rerun:
 run:
 	nohup ./chore_svr >> chore_svr.log 2>&1 &
 	@echo chore_svr started in background, log: chore_svr.log
-
-open:
-	./chore -o

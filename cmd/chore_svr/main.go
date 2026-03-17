@@ -2,22 +2,29 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"chore/internal/server"
 	"chore/internal/store"
+	"github.com/atotto/clipboard"
 )
 
 // Override at build time with -ldflags "-X main.defaultAddr=..."
 var defaultAddr = ":2026"
 
-// parseIDs parses -id: single id, range 2-10, space-separated 2 5 8, or mixed 2 5-8 10. Returns deduplicated ids.
+type localConfig struct {
+	Name string `json:"name"`
+}
+
+// parseIDs parses -i such as "3", "2-10", or "1-4,7,10". Returns deduplicated ids.
 func parseIDs(s string) ([]int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -25,11 +32,21 @@ func parseIDs(s string) ([]int64, error) {
 	}
 	seen := make(map[int64]bool)
 	var list []int64
-	for _, part := range strings.Fields(s) {
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
 		if strings.Contains(part, "-") {
-			idx := strings.Index(part, "-")
-			start, err1 := strconv.ParseInt(strings.TrimSpace(part[:idx]), 10, 64)
-			end, err2 := strconv.ParseInt(strings.TrimSpace(part[idx+1:]), 10, 64)
+			rangeParts := strings.SplitN(part, "-", 2)
+			if len(rangeParts) != 2 || strings.TrimSpace(rangeParts[0]) == "" || strings.TrimSpace(rangeParts[1]) == "" {
+				return nil, fmt.Errorf("invalid range %q, use start-end", part)
+			}
+			start, err1 := strconv.ParseInt(strings.TrimSpace(rangeParts[0]), 10, 64)
+			end, err2 := strconv.ParseInt(strings.TrimSpace(rangeParts[1]), 10, 64)
 			if err1 != nil || err2 != nil || start < 1 || end < 1 || start > end {
 				return nil, fmt.Errorf("invalid range %q, use start-end with start<=end", part)
 			}
@@ -53,64 +70,114 @@ func parseIDs(s string) ([]int64, error) {
 	return list, nil
 }
 
+func loadConfig(path string) (localConfig, error) {
+	var cfg localConfig
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return cfg, err
+	}
+	if len(strings.TrimSpace(string(b))) == 0 {
+		return cfg, nil
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return cfg, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+func serviceNameFromExec() string {
+	name := filepath.Base(os.Args[0])
+	name = strings.TrimSuffix(name, ".exe")
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "chore"
+	}
+	if idx := strings.Index(name, "_"); idx > 0 {
+		name = strings.TrimSpace(name[:idx])
+	}
+	if name == "" {
+		return "chore"
+	}
+	return name
+}
+
+func resolveName(cliName string, cfg localConfig) string {
+	if v := strings.TrimSpace(cliName); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(cfg.Name); v != "" {
+		return v
+	}
+	return serviceNameFromExec()
+}
+
 func main() {
 	addr := flag.String("addr", defaultAddr, "listen address (server mode only)")
 	dbDir := flag.String("dbDir", "./", "directory for sqlite DBs, one per client name (e.g. abc.db)")
-	name := flag.String("n", "", "required for local delete/search/update: sqlite DB name (e.g. chore -> chore.db)")
-	idArg := flag.String("id", "", "local delete by id(s); or with -title/-tags: update that id (single id only)")
-	title := flag.String("title", "", "with -id -n: set title (update mode, single id)")
-	tags := flag.String("tags", "", "with -id -n: set tags, comma-separated (update mode, single id)")
+	name := flag.String("name", "", "DB name (optional). Fallback order: -name > chore.json:name > service name")
+	idArg := flag.String("i", "", "get/update/delete by id; delete requires -delete (supports 1-4,7,10)")
+	deleteMode := flag.Bool("delete", false, "with -i: delete records by id list/range")
+	cp := flag.Bool("c", false, "with -i get mode: copy content to clipboard instead of stdout")
+	title := flag.String("title", "", "with -i: set title (update mode, single id)")
+	tags := flag.String("tags", "", "with -i: set tags, comma-separated (update mode, single id)")
 	q := flag.String("q", "", "local search by content and print, then exit")
-	limit := flag.Int("limit", 0, "with -q: max results; without -q: show last N items (requires -n)")
+	limit := flag.Int("limit", 0, "with -q: max results; without -q: show last N items")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `chore_svr - receive paste from chore, store per-client sqlite; or use as local delete/search/list/update tool
 
 Usage:
   Start server (default)   chore_svr [-addr :2026] [-dbDir ./]
-  Local delete             chore_svr -n <dbname> -id <id or range or list>
-  Local update             chore_svr -n <dbname> -id <single-id> [-title "x"] [-tags "a,b"]
-  Local search & print     chore_svr -n <dbname> -q "keyword" [-limit 20]
-  Last N items             chore_svr -n <dbname> -limit N (no -q; preview truncated)
+  Get content by id        chore_svr [-name <dbname>] -i <id> [-c]
+  Local delete             chore_svr [-name <dbname>] -i <1-4,7,10> -delete
+  Local update             chore_svr [-name <dbname>] -i <single-id> [-title "x"] [-tags "a,b"]
+  Local search & print     chore_svr [-name <dbname>] -q "keyword" [-limit 20]
+  Last N items             chore_svr [-name <dbname>] -limit N (no -q; preview truncated)
 
-  -id for delete: -id 3  |  -id 2-10  |  -id 2 -id 5 -id 8
+  -i examples: -i 3 | -i 2-10 | -i 1-4,7,10
+  Name fallback: -name > chore.json("name") > executable name
 
 Options:
 `)
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, `
-API when running as server (no -id/-q/-limit):
+API when running as server (no -i/-q/-limit):
   POST   /api/paste         upload (Body: JSON {"content":"..."} or plain text)
   PATCH  /api/paste/:id    update title and/or tags (Body: JSON {"title":"...", "tags":["a","b"]})
-  GET    /list /list/:name history list (paginated, with search)
+  GET    /list /list/:name history list + search (q=...; paginated)
   GET    /detail/:name/:id single item detail
-  GET    /search/:name?q=... search page (paginated)
 `)
 	}
 	flag.Parse()
+	cfg, err := loadConfig("chore.json")
+	if err != nil {
+		log.Fatalf("load config chore.json: %v", err)
+	}
+	resolvedName := store.SanitizeClientName(resolveName(*name, cfg))
+	idValue := strings.TrimSpace(*idArg)
+	cpValue := *cp
 
 	manager := store.NewManager(*dbDir)
 	defer manager.Close()
 
-	if strings.TrimSpace(*idArg) != "" {
-		if strings.TrimSpace(*name) == "" {
-			log.Fatal("specify -n (sqlite DB name), e.g. chore_svr -n chore -id 1")
-		}
-		ids, err := parseIDs(*idArg)
+	if idValue != "" {
+		ids, err := parseIDs(idValue)
 		if err != nil {
-			log.Fatalf("parse -id: %v", err)
+			log.Fatalf("parse -i: %v", err)
 		}
 		if len(ids) == 0 {
-			log.Fatal("-id yielded no valid ids; use single id, range 2-10, or space-separated 2 5 8")
+			log.Fatal("-i yielded no valid ids; use single id, range 2-10, or mixed 1-4,7,10")
 		}
-		dbName := store.SanitizeClientName(*name)
-		st, err := manager.GetStore(dbName)
+		st, err := manager.GetStore(resolvedName)
 		if err != nil {
-			log.Fatalf("open DB %s: %v", dbName, err)
+			log.Fatalf("open DB %s: %v", resolvedName, err)
 		}
 		doUpdate := strings.TrimSpace(*title) != "" || strings.TrimSpace(*tags) != ""
 		if doUpdate {
 			if len(ids) != 1 {
-				log.Fatal("for update (-title/-tags) use a single -id")
+				log.Fatal("for update (-title/-tags) use a single -i")
 			}
 			var titlePtr *string
 			var tagsPtr *[]string
@@ -134,36 +201,56 @@ API when running as server (no -id/-q/-limit):
 			if !updated {
 				log.Fatalf("id %d not found", ids[0])
 			}
-			fmt.Printf("ok, updated id %d\n", ids[0])
+			fmt.Printf("updated id %d\n", ids[0])
 			return
 		}
-		var deleted int64
-		for _, id := range ids {
-			n, err := st.Delete(context.Background(), id)
-			if err != nil {
-				log.Fatalf("delete id %d: %v", id, err)
+		if *deleteMode {
+			var deleted int64
+			for _, id := range ids {
+				n, err := st.Delete(context.Background(), id)
+				if err != nil {
+					log.Fatalf("delete id %d: %v", id, err)
+				}
+				deleted += n
 			}
-			deleted += n
+			fmt.Printf("deleted %d\n", deleted)
+			return
 		}
-		fmt.Printf("ok, deleted %d\n", deleted)
+		if len(ids) != 1 {
+			log.Fatal("get mode requires a single -i; for multiple ids, use -delete")
+		}
+		p, err := st.Get(context.Background(), ids[0])
+		if err != nil {
+			log.Fatalf("get id %d: %v", ids[0], err)
+		}
+		if p == nil {
+			log.Fatalf("id %d not found", ids[0])
+		}
+		if cpValue {
+			if err := clipboard.WriteAll(p.Content); err != nil {
+				log.Fatalf("copy to clipboard: %v", err)
+			}
+			return
+		}
+		fmt.Print(p.Content)
 		return
+
+	}
+	if *deleteMode {
+		log.Fatal("-delete requires -i")
 	}
 	const previewRunes = 100
 	if *q != "" {
-		if strings.TrimSpace(*name) == "" {
-			log.Fatal("for search, specify -n (DB name), e.g. chore_svr -n chore -q \"keyword\"")
-		}
-		dbName := store.SanitizeClientName(*name)
 		searchLimit := *limit
 		if searchLimit <= 0 {
-			searchLimit = 5
+			searchLimit = 20
 		}
-		if searchLimit > 5 {
-			searchLimit = 5
+		if searchLimit > 20 {
+			searchLimit = 20
 		}
-		st, err := manager.GetStore(dbName)
+		st, err := manager.GetStore(resolvedName)
 		if err != nil {
-			log.Fatalf("open DB %s: %v", dbName, err)
+			log.Fatalf("open DB %s: %v", resolvedName, err)
 		}
 		list, total, err := st.Search(context.Background(), *q, 0, searchLimit)
 		if err != nil {
@@ -180,13 +267,9 @@ API when running as server (no -id/-q/-limit):
 		return
 	}
 	if *limit > 0 {
-		if strings.TrimSpace(*name) == "" {
-			log.Fatal("for last N items, specify -n, e.g. chore_svr -n chore -limit 10")
-		}
-		dbName := store.SanitizeClientName(*name)
-		st, err := manager.GetStore(dbName)
+		st, err := manager.GetStore(resolvedName)
 		if err != nil {
-			log.Fatalf("open DB %s: %v", dbName, err)
+			log.Fatalf("open DB %s: %v", resolvedName, err)
 		}
 		list, total, err := st.List(context.Background(), 0, *limit)
 		if err != nil {
@@ -212,8 +295,6 @@ API when running as server (no -id/-q/-limit):
 	h := server.New(manager)
 	http.HandleFunc("/api/paste", logRequest(h.HandlePaste))
 	http.HandleFunc("/api/paste/", logRequest(h.HandlePatchPaste))
-	http.HandleFunc("/search", logRequest(h.HandleSearchPage))
-	http.HandleFunc("/search/", logRequest(h.HandleSearchPage))
 	http.HandleFunc("/list", logRequest(h.HandleList))
 	http.HandleFunc("/list/", logRequest(h.HandleList))
 	http.HandleFunc("/detail/", logRequest(h.HandleDetail))

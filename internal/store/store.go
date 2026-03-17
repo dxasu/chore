@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sort"
 	"strings"
 	"time"
@@ -10,12 +11,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const maxTags = 6
+const maxTags = 10
+
+var ErrDuplicateLatestContent = errors.New("duplicate latest content")
 
 type Paste struct {
 	ID        int64     `json:"id"`
 	Title     string    `json:"title"`
-	Tags      string    `json:"tags"` // 逗号分隔，最多 6 个，按字符顺序排列
+	Tags      string    `json:"tags"` // 逗号分隔，最多 10 个，按字符顺序排列
 	Content   string    `json:"content"`
 	CreatedAt time.Time `json:"created_at"`
 	ClientIP  string    `json:"client_ip"`
@@ -132,6 +135,15 @@ func normalizeTags(tags []string) string {
 }
 
 func (s *Store) Add(ctx context.Context, content, title string, tags []string, clientIP, userAgent string) (int64, time.Time, error) {
+	var latest string
+	err := s.db.QueryRowContext(ctx, `SELECT content FROM paste ORDER BY created_at DESC, id DESC LIMIT 1`).Scan(&latest)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, time.Time{}, err
+	}
+	if err == nil && latest == content {
+		return 0, time.Time{}, ErrDuplicateLatestContent
+	}
+
 	if title == "" {
 		title = defaultTitle(content)
 	}
@@ -228,7 +240,7 @@ func (s *Store) Delete(ctx context.Context, id int64) (int64, error) {
 	return n, nil
 }
 
-// Search 按内容或标签模糊搜索，按 created_at 倒序，最多返回 limit 条（内部限制最大 20）。返回本页列表与匹配总数。
+// Search 按标题、内容或标签模糊搜索，按 created_at 倒序，最多返回 limit 条（内部限制最大 20）。返回本页列表与匹配总数。
 func (s *Store) Search(ctx context.Context, query string, offset, limit int) ([]*Paste, int64, error) {
 	if limit <= 0 {
 		limit = 20
@@ -236,15 +248,56 @@ func (s *Store) Search(ctx context.Context, query string, offset, limit int) ([]
 	if limit > 20 {
 		limit = 20
 	}
-	pattern := "%" + query + "%"
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return []*Paste{}, 0, nil
+	}
+
+	field := "all"
+	value := query
+	if idx := strings.Index(query, ":"); idx > 0 {
+		key := strings.ToLower(strings.TrimSpace(query[:idx]))
+		if key == "title" || key == "content" || key == "tags" {
+			field = key
+			value = strings.TrimSpace(query[idx+1:])
+		}
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return []*Paste{}, 0, nil
+	}
+	pattern := "%" + value + "%"
+
+	var (
+		whereClause string
+		whereArgs   []any
+	)
+	switch field {
+	case "title":
+		whereClause = "title LIKE ?"
+		whereArgs = []any{pattern}
+	case "content":
+		whereClause = "content LIKE ?"
+		whereArgs = []any{pattern}
+	case "tags":
+		whereClause = "tags LIKE ?"
+		whereArgs = []any{pattern}
+	default:
+		whereClause = "(title LIKE ? OR content LIKE ? OR tags LIKE ?)"
+		whereArgs = []any{pattern, pattern, pattern}
+	}
+
 	var total int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM paste WHERE content LIKE ? OR tags LIKE ?`, pattern, pattern).Scan(&total)
+	countArgs := append([]any{}, whereArgs...)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM paste WHERE `+whereClause, countArgs...).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
+	listArgs := append([]any{}, whereArgs...)
+	listArgs = append(listArgs, limit, offset)
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, title, tags, content, created_at, client_ip, user_agent FROM paste WHERE content LIKE ? OR tags LIKE ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
-		pattern, pattern, limit, offset,
+		`SELECT id, title, tags, content, created_at, client_ip, user_agent FROM paste WHERE `+whereClause+` ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+		listArgs...,
 	)
 	if err != nil {
 		return nil, 0, err
