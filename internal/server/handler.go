@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -11,7 +12,7 @@ import (
 )
 
 const (
-	previewLen = 200
+	previewLen   = 200
 	tagMarkdown = "md"
 )
 
@@ -468,6 +469,7 @@ func detailPage(clientName string, p *store.Paste) string {
 
 	mdNote := ""
 	mdScript := ""
+	contentAreaInner := ""
 	if isMD {
 		mdNote = `<p class="meta">（Markdown 预览）</p>`
 		mdScript = `
@@ -491,7 +493,15 @@ func detailPage(clientName string, p *store.Paste) string {
       document.head.appendChild(s);
     })();
   </script>`
+	} else if hasTagURL(p.Tags) {
+		// 非 MD 且 tags 中有 "url" 标签：内容区中的 URL 文本转为可点击链接
+		contentAreaInner = contentToHTML(p.Content)
+		mdScript = `
+  <script>
+    (function(){ window.rawContent = document.getElementById('content-raw') ? JSON.parse(document.getElementById('content-raw').textContent) : ''; })();
+  </script>`
 	} else {
+		// 非 MD 且无 "url" 标签：内容区纯文本展示
 		mdScript = `
   <script>
     (function(){
@@ -531,11 +541,11 @@ func detailPage(clientName string, p *store.Paste) string {
 </head>
 <body>
   <h1>` + escapeHTML(trimTitleForPage(p.Title, p.ID)) + `</h1>
-  <div class="meta">#` + strconv.FormatInt(p.ID, 10) + " · " + p.CreatedAt.Format("2006-01-02 15:04:05") + " · 标签: " + escapeHTML(p.Tags) + " · IP: " + escapeHTML(p.ClientIP) + " · " + escapeHTML(p.UserAgent) + `</div>
+  <div class="meta">#` + strconv.FormatInt(p.ID, 10) + " · " + p.CreatedAt.Format("2006-01-02 15:04:05") + " · 标签: " + tagsToHTML(p.Tags) + " · IP: " + escapeHTML(p.ClientIP) + " · " + escapeHTML(p.UserAgent) + `</div>
   <div class="toolbar"><button type="button" onclick="(function(){var t=document.getElementById('copy-toast');function show(m){t.textContent=m;t.classList.add('show');setTimeout(function(){t.classList.remove('show');},1500);}var c=window.rawContent;if(c===undefined){show('复制失败');return;}navigator.clipboard.writeText(c).then(function(){show('已复制');}).catch(function(){show('复制失败');});})();">复制</button><span id="copy-toast" class="toast" aria-live="polite"></span></div>
   ` + mdNote + `
   <script type="application/json" id="content-raw">` + contentJSONStr + `</script>
-  <div id="content-area" class="content"></div>
+  <div id="content-area" class="content" style="white-space: pre-wrap;">` + contentAreaInner + `</div>
   ` + mdScript + `
   <script>window.rawContent = document.getElementById('content-raw') ? JSON.parse(document.getElementById('content-raw').textContent) : '';</script>
   <p><a href="/list/` + clientName + `">返回列表</a></p>
@@ -557,3 +567,72 @@ func escapeHTML(s string) string {
 	s = strings.ReplaceAll(s, "\"", "&quot;")
 	return s
 }
+
+// escapeHTMLAttr 用于 HTML 属性值（如 href），避免断属性与 XSS
+func escapeHTMLAttr(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	return s
+}
+
+
+// hasTagURL 判断 tags 中是否存在名为 "url" 的标签（仅这 3 个字符）
+func hasTagURL(tags string) bool {
+	for _, part := range strings.Split(tags, ",") {
+		if strings.TrimSpace(part) == "url" {
+			return true
+		}
+	}
+	return false
+}
+
+// urlPattern 匹配正文中的 http/https URL（至空格或结束）
+var urlPattern = regexp.MustCompile(`https?://[^\s<>"']+`)
+
+// contentToHTML 将正文中的 URL 文本转为可点击链接，其余转义展示（保留换行，white-space: pre-wrap）
+func contentToHTML(content string) string {
+	inds := urlPattern.FindAllStringIndex(content, -1)
+	if len(inds) == 0 {
+		return escapeHTML(content)
+	}
+	var buf strings.Builder
+	last := 0
+	for _, ab := range inds {
+		a, b := ab[0], ab[1]
+		buf.WriteString(escapeHTML(content[last:a]))
+		url := content[a:b]
+		buf.WriteString(`<a href="`)
+		buf.WriteString(escapeHTMLAttr(url))
+		buf.WriteString(`" target="_blank" rel="noopener">`)
+		buf.WriteString(escapeHTML(url))
+		buf.WriteString("</a>")
+		last = b
+	}
+	buf.WriteString(escapeHTML(content[last:]))
+	return buf.String()
+}
+
+// tagsToHTML 将逗号分隔的标签转为 HTML（标签中不含 URL，仅转义展示）
+func tagsToHTML(tags string) string {
+	if strings.TrimSpace(tags) == "" {
+		return "-"
+	}
+	var buf strings.Builder
+	for i, part := range strings.Split(tags, ",") {
+		tag := strings.TrimSpace(part)
+		if tag == "" {
+			continue
+		}
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(escapeHTML(tag))
+	}
+	if buf.Len() == 0 {
+		return "-"
+	}
+	return buf.String()
+}
+

@@ -62,11 +62,13 @@ func main() {
 	tags := flag.String("tags", "", "with -id -n: set tags, comma-separated (update mode, single id)")
 	q := flag.String("q", "", "local search by content and print, then exit")
 	limit := flag.Int("limit", 0, "with -q: max results; without -q: show last N items (requires -n)")
+	getContent := flag.Bool("get", false, "with -n -id: print content of the given id only, then exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `chore_svr - receive paste from chore, store per-client sqlite; or use as local delete/search/list/update tool
 
 Usage:
   Start server (default)   chore_svr [-addr :2026] [-dbDir ./]
+  Get content by id        chore_svr -n <dbname> -id <id> -get
   Local delete             chore_svr -n <dbname> -id <id or range or list>
   Local update             chore_svr -n <dbname> -id <single-id> [-title "x"] [-tags "a,b"]
   Local search & print     chore_svr -n <dbname> -q "keyword" [-limit 20]
@@ -90,6 +92,37 @@ API when running as server (no -id/-q/-limit):
 
 	manager := store.NewManager(*dbDir)
 	defer manager.Close()
+
+	// -get: 按 id 获取并打印内容
+	if *getContent {
+		if strings.TrimSpace(*name) == "" {
+			log.Fatal("for -get, specify -n (DB name), e.g. chore_svr -n chore -id 1 -get")
+		}
+		if strings.TrimSpace(*idArg) == "" {
+			log.Fatal("for -get, specify -id (single id), e.g. chore_svr -n chore -id 1 -get")
+		}
+		ids, err := parseIDs(*idArg)
+		if err != nil {
+			log.Fatalf("parse -id: %v", err)
+		}
+		if len(ids) != 1 {
+			log.Fatal("for -get use a single -id")
+		}
+		dbName := store.SanitizeClientName(*name)
+		st, err := manager.GetStore(dbName)
+		if err != nil {
+			log.Fatalf("open DB %s: %v", dbName, err)
+		}
+		p, err := st.Get(context.Background(), ids[0])
+		if err != nil {
+			log.Fatalf("get id %d: %v", ids[0], err)
+		}
+		if p == nil {
+			log.Fatalf("id %d not found", ids[0])
+		}
+		fmt.Print(p.Content)
+		return
+	}
 
 	if strings.TrimSpace(*idArg) != "" {
 		if strings.TrimSpace(*name) == "" {
