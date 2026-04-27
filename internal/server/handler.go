@@ -13,10 +13,28 @@ import (
 	"chore/internal/store"
 )
 
+const previewLen = 200
+
+// 内置特殊标签：上传时写在 tags 里（逗号分隔），经 trim 后与下列字面量完全匹配即由服务端识别。
+// 便于查阅与维护，新增内置语义时请在此补充常量并在注释中说明用途。
 const (
-	previewLen  = 200
-	tagMarkdown = "md"
+	specialTagMarkdown = "md"   // 详情页：正文按 Markdown 渲染
+	specialTagJSON     = "json" // 详情页：合法 JSON 为可折叠树 + 简易配色；非法或多值 JSON 为转义原文（与 md 并存时 md 优先）
+	specialTagYAML     = "yaml" // 详情页：YAML 可折叠树（gopkg.in/yaml.v3）；解析失败为转义原文（与 md 并存时 md 优先）
+	specialTagSH       = "sh"   // 详情页：Shell 脚本仅 bash 语法高亮（Prism，MIT），不执行（与 md 并存时 md 优先）
+	specialTagURL      = "url"  // 详情页（非 md）：正文中 http(s) URL 转为可点击链接
+	specialTagSafe     = "safe" // 经 HTTP（浏览器、chore 等）的列表/详情 JSON 与 HTML 均不展示正文；库内仍存全文，chore_svr 本地读库命令可查看
 )
+
+// pasteHasTag 判断逗号分隔的 tags 中是否存在指定内置标签名（trim 后精确匹配）
+func pasteHasTag(tags, name string) bool {
+	for _, part := range strings.Split(tags, ",") {
+		if strings.TrimSpace(part) == name {
+			return true
+		}
+	}
+	return false
+}
 
 // StoreGetter 按客户端名返回 Store，用于按名选择 sqlite（如 abc -> abc.db）
 type StoreGetter interface {
@@ -209,8 +227,9 @@ func (s *Server) HandleList(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(accept, "application/json") {
 		w.Header().Set("Content-Type", "application/json")
 		totalPages := (int(total) + perPage - 1) / perPage
+		items := redactSafeContentCopies(list)
 		json.NewEncoder(w).Encode(map[string]any{
-			"items":       list,
+			"items":       items,
 			"total":       total,
 			"page":        page,
 			"per_page":    perPage,
@@ -280,13 +299,13 @@ func (s *Server) HandleDetail(w http.ResponseWriter, r *http.Request) {
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "application/json") {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(p)
+		json.NewEncoder(w).Encode(redactSafePasteForHTTP(p))
 		return
 	}
 
 	// HTML 详情页
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	html := detailPage(clientName, p)
+	html := detailPage(clientName, redactSafePasteForHTTP(p))
 	w.Write([]byte(html))
 }
 
@@ -304,13 +323,48 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// listTableRows 与 listTableStyles 供 list 与 search 共用，保证布局一致
+// redactSafePasteForHTTP 对含 safe 的条目返回正文已清空的副本，供 HTTP JSON/HTML 使用（不修改 store）
+func redactSafePasteForHTTP(p *store.Paste) *store.Paste {
+	if p == nil || !pasteHasTag(p.Tags, specialTagSafe) {
+		return p
+	}
+	cpy := *p
+	cpy.Content = ""
+	return &cpy
+}
+
+// redactSafeContentCopies 在 HTTP 列表 API 返回中，对含 safe 标签的条目清空 content（浅拷贝）
+func redactSafeContentCopies(list []*store.Paste) []*store.Paste {
+	out := make([]*store.Paste, len(list))
+	for i, p := range list {
+		if p == nil {
+			out[i] = nil
+			continue
+		}
+		if pasteHasTag(p.Tags, specialTagSafe) {
+			cpy := *p
+			cpy.Content = ""
+			out[i] = &cpy
+		} else {
+			out[i] = p
+		}
+	}
+	return out
+}
+
+// listTableRows 与 listTableStyles 供 list 与 search 共用，保证布局一致。
+// 带 safe 标签的条目在「内容预览」列不展示正文（HTTP 列表页）。
 func listTableRows(clientName string, list []*store.Paste, emptyColspan int, emptyMsg string) string {
 	rows := ""
 	for _, p := range list {
-		preview := p.Content
-		if len([]rune(preview)) > previewLen {
-			preview = string([]rune(preview)[:previewLen]) + "..."
+		var preview string
+		if pasteHasTag(p.Tags, specialTagSafe) {
+			preview = "（已隐藏）"
+		} else {
+			preview = p.Content
+			if len([]rune(preview)) > previewLen {
+				preview = string([]rune(preview)[:previewLen]) + "..."
+			}
 		}
 		detailURL := "/detail/" + clientName + "/" + strconv.FormatInt(p.ID, 10)
 		titleCell := p.Title
@@ -321,10 +375,14 @@ func listTableRows(clientName string, list []*store.Paste, emptyColspan int, emp
 		if tagsCell == "" {
 			tagsCell = "-"
 		}
+		previewClass := "preview-text"
+		if pasteHasTag(p.Tags, specialTagSafe) {
+			previewClass = "preview-text preview-hidden"
+		}
 		rows += `<tr>
   <td class="col-id">` + strconv.FormatInt(p.ID, 10) + `</td>
   <td class="col-title">` + escapeHTML(titleCell) + `</td>
-  <td class="col-preview"><span class="preview-text">` + escapeHTML(preview) + `</span></td>
+  <td class="col-preview"><span class="` + previewClass + `">` + escapeHTML(preview) + `</span></td>
   <td class="col-tags">` + escapeHTML(tagsCell) + `</td>
   <td class="col-time">` + p.CreatedAt.Format("2006-01-02 15:04:05") + `</td>
   <td class="col-detail"><a href="` + detailURL + `">详情</a></td>
@@ -436,6 +494,7 @@ const listTableStyles = `
     .col-time { font-size: 0.85rem; color: var(--muted); }
     .col-tags { color: #4b5563; }
     .col-preview .preview-text { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .col-preview .preview-hidden { color: var(--muted); font-style: italic; }
     .pagination {
       margin-top: 1rem;
       display: flex;
@@ -517,75 +576,43 @@ func listPage(clientName, query string, list []*store.Paste, total, page, perPag
 
 // looksLikeMarkdown checks if the tags indicate Markdown content
 func looksLikeMarkdown(tags string) bool {
-	tagsList := strings.Split(tags, ",")
-	for _, tag := range tagsList {
-		tag = strings.TrimSpace(tag)
-		if tag == tagMarkdown {
-			return true
-		}
-	}
-	return false
+	return pasteHasTag(tags, specialTagMarkdown)
 }
 
 func detailPage(clientName string, p *store.Paste) string {
-	contentJSON, _ := json.Marshal(p.Content)
+	if p == nil {
+		return ""
+	}
+	rawForEmbed := p.Content
+	if pasteHasTag(p.Tags, specialTagSafe) {
+		rawForEmbed = ""
+	}
+	contentJSON, _ := json.Marshal(rawForEmbed)
 	contentJSONStr := string(contentJSON)
 	contentJSONStr = strings.ReplaceAll(contentJSONStr, "</script>", "<\\/script>")
-	isMD := looksLikeMarkdown(p.Tags)
+	isHiddenSafe := pasteHasTag(p.Tags, specialTagSafe)
 
-	mdNote := ""
-	mdScript := ""
-	contentAreaInner := ""
-	if isMD {
-		mdNote = `<p class="meta">（Markdown 预览）</p>`
-		mdScript = `
-  <script>
-    (function(){
-      var rawContent = (function(){ var e = document.getElementById('content-raw'); return e ? JSON.parse(e.textContent) : ''; })();
-      var el = document.getElementById('content-area');
-      function render(){
-        if (typeof marked !== 'undefined') {
-          el.innerHTML = marked.parse(rawContent);
-          el.classList.add('markdown-body');
-        } else {
-          el.textContent = rawContent;
-          el.style.whiteSpace = 'pre-wrap';
-        }
-      }
-      var s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/marked/marked.min.js';
-      s.onload = render;
-      s.onerror = function(){ el.textContent = rawContent; el.style.whiteSpace = 'pre-wrap'; };
-      document.head.appendChild(s);
-    })();
-  </script>`
-	} else if hasTagURL(p.Tags) {
-		// 非 MD 且 tags 中有 "url" 标签：内容区中的 URL 文本转为可点击链接
-		contentAreaInner = contentToHTML(p.Content)
-		mdScript = `
-  <script>
-    (function(){ window.rawContent = document.getElementById('content-raw') ? JSON.parse(document.getElementById('content-raw').textContent) : ''; })();
-  </script>`
+	var frag detailBodyFragment
+	if isHiddenSafe {
+		frag = detailBodyForSafeHidden()
 	} else {
-		// 非 MD 且无 "url" 标签：内容区纯文本展示
-		mdScript = `
-  <script>
-    (function(){
-      var e = document.getElementById('content-raw');
-      var rawContent = e ? JSON.parse(e.textContent) : '';
-      var el = document.getElementById('content-area');
-      el.textContent = rawContent;
-      el.style.whiteSpace = 'pre-wrap';
-      window.rawContent = rawContent;
-    })();
-  </script>`
+		frag = selectDetailBodyByTags(p)
+	}
+
+	qrBoxClass := "qr-box"
+	qrBoxTitle := "点击二维码复制内容"
+	qrLabel := "点击复制内容"
+	if isHiddenSafe {
+		qrBoxClass = "qr-box qr-disabled"
+		qrBoxTitle = "safe 记录不在此页复制正文"
+		qrLabel = "不展示正文"
 	}
 
 	return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>` + escapeHTML(trimTitleForPage(p.Title, p.ID)) + `</title>
+` + frag.ExtraHead + `  <title>` + escapeHTML(trimTitleForPage(p.Title, p.ID)) + `</title>
   <style>
     :root {
       --bg: #f3f6fb;
@@ -711,6 +738,8 @@ func detailPage(clientName string, p *store.Paste) string {
       font-size: 0.92rem;
       color: #8b95a3;
     }
+    .content-hidden-placeholder { color: var(--muted); font-style: italic; }
+    .qr-box.qr-disabled { opacity: 0.45; cursor: default; pointer-events: none; }
     @media (max-width: 760px) {
       .page-shell { padding: 1rem; border-radius: 16px; }
       .header-row { gap: 0.55rem; }
@@ -720,6 +749,7 @@ func detailPage(clientName string, p *store.Paste) string {
       .qr-box { width: auto; height: 82px; padding: 0.28rem; }
       .qr-box img { width: 62px; height: 62px; }
     }
+` + frag.ExtraFormatCSS + `
   </style>
 </head>
 <body>
@@ -729,16 +759,16 @@ func detailPage(clientName string, p *store.Paste) string {
         <h1>` + escapeHTML(trimTitleForPage(p.Title, p.ID)) + `</h1>
         <div class="meta">#` + strconv.FormatInt(p.ID, 10) + " · " + p.CreatedAt.Format("2006-01-02 15:04:05") + " · 标签: " + tagsToHTML(p.Tags) + " · IP: " + escapeHTML(p.ClientIP) + " · " + escapeHTML(p.UserAgent) + `</div>
       </div>
-      <aside class="qr-box" id="copy-via-qr" title="点击二维码复制内容">
-        <p class="label">点击复制内容</p>
+      <aside class="` + qrBoxClass + `" id="copy-via-qr" title="` + escapeHTMLAttr(qrBoxTitle) + `">
+        <p class="label">` + escapeHTML(qrLabel) + `</p>
         <img id="page-qr" alt="当前页面二维码" />
       </aside>
     </div>
     <span id="copy-toast" class="toast" aria-live="polite"></span>
-    ` + mdNote + `
+    ` + frag.MetaNote + `
     <script type="application/json" id="content-raw">` + contentJSONStr + `</script>
-    <div id="content-area" class="content" style="white-space: pre-wrap;">` + contentAreaInner + `</div>
-    ` + mdScript + `
+    <div id="content-area" class="content` + frag.ContentAreaClass + `" style="white-space: pre-wrap;">` + frag.ContentInner + `</div>
+    ` + frag.FootScript + `
     <p class="page-footer"><a href="/list/` + clientName + `">返回列表</a></p>
   </main>
   <script>
@@ -831,16 +861,6 @@ func escapeHTMLAttr(s string) string {
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	s = strings.ReplaceAll(s, "\"", "&quot;")
 	return s
-}
-
-// hasTagURL 判断 tags 中是否存在名为 "url" 的标签（仅这 3 个字符）
-func hasTagURL(tags string) bool {
-	for _, part := range strings.Split(tags, ",") {
-		if strings.TrimSpace(part) == "url" {
-			return true
-		}
-	}
-	return false
 }
 
 // urlPattern 匹配正文中的 http/https URL（至空格或结束）
