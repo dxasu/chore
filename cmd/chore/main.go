@@ -201,6 +201,7 @@ func main() {
 	}
 
 	if !*verbose {
+		// fmt.Println(out.ID)
 		return
 	}
 	fmt.Printf("saved #%d %s\n", out.ID, out.CreatedAt)

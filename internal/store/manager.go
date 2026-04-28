@@ -1,3 +1,5 @@
+// Package store 的 manager.go 文件实现多数据库的并发管理。
+// （包级注释见 store.go）
 package store
 
 import (
@@ -6,21 +8,28 @@ import (
 	"sync"
 )
 
-// Manager 按客户端名管理多个 SQLite Store，每个名称对应一个 {name}.db 文件。
+// Manager 按客户端名管理多个 SQLite Store，每个名称对应 dbDir 下的 {name}.db 文件。
+//
+// 设计原则：
+//   - 懒加载：第一次 GetStore 时才打开数据库，之后复用缓存。
+//   - 并发安全：读操作持读锁，写（创建新 Store）时升级为写锁，并做 double-check 避免重复创建。
+//   - 名称白名单：仅允许 a-z A-Z 0-9 _ - 的名称，非法名称统一降级为 "chore"，防止路径穿越。
 type Manager struct {
 	dbDir  string
 	mu     sync.RWMutex
 	stores map[string]*Store
 }
 
-// 只允许字母、数字、下划线、连字符，避免路径注入
+// safeClientName 只允许字母、数字、下划线、连字符，避免路径注入。
 var safeClientName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// sanitizeClientName 是包内使用的简写，直接委托给导出版本。
 func sanitizeClientName(name string) string {
 	return SanitizeClientName(name)
 }
 
-// SanitizeClientName 供外部（如 server 拼 URL）使用，仅保留安全字符，空或非法返回 "chore"。
+// SanitizeClientName 过滤客户端名称，供 server 包拼接 URL 路径时调用。
+// 空字符串或含非法字符时返回 "chore"，保证路径安全。
 func SanitizeClientName(name string) string {
 	if name == "" {
 		return "chore"

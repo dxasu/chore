@@ -1,3 +1,16 @@
+// Package server 实现 chore HTTP 服务的全部路由处理器与 HTML 页面渲染。
+//
+// 路由概览（由 cmd/chore_svr/main.go 注册）：
+//   - POST /api/paste          上传新记录（纯文本或 JSON body）
+//   - PATCH /api/paste/:id     更新 title/tags（JSON body）
+//   - GET  /list[/:name]       分页历史列表，支持 q=... 搜索
+//   - GET  /search[/:name]     兼容旧链接，301 重定向到 /list
+//   - GET  /detail/:name/:id   单条记录详情页
+//
+// 内置标签语义（详见常量块）：
+//   - safe：HTTP 列表/详情隐藏正文（store 仍存全文）
+//   - hide：HTTP 列表/搜索/详情完全过滤该行（store.TagHide）
+//   - md / json / yaml / sh / url：详情页正文渲染格式（由 detailFormatRegistry 驱动）
 package server
 
 import (
@@ -13,21 +26,48 @@ import (
 	"chore/internal/store"
 )
 
+// previewLen 是列表页「内容预览」列截取的最大 Unicode 字符数。
 const previewLen = 200
 
-// 内置特殊标签：上传时写在 tags 里（逗号分隔），经 trim 后与下列字面量完全匹配即由服务端识别。
-// 便于查阅与维护，新增内置语义时请在此补充常量并在注释中说明用途。
+// 内置特殊标签（special tags）——上传时写入 tags 字段（逗号分隔），
+// 经 normalizeTags 规范化后服务端按精确匹配识别语义。
+//
+// 新增内置语义时请在此处补充常量与注释，保持全局可查。
+//
+// 渲染类标签互斥优先级（从高到低）：md > json > yaml > sh > url > 纯文本。
+// 访问控制类标签（safe/hide）与渲染类正交，先于渲染判断。
 const (
-	specialTagMarkdown = "md"   // 详情页：正文按 Markdown 渲染
-	specialTagJSON     = "json" // 详情页：合法 JSON 为可折叠树 + 简易配色；非法或多值 JSON 为转义原文（与 md 并存时 md 优先）
-	specialTagYAML     = "yaml" // 详情页：YAML 可折叠树（gopkg.in/yaml.v3）；解析失败为转义原文（与 md 并存时 md 优先）
-	specialTagSH       = "sh"   // 详情页：Shell 脚本仅 bash 语法高亮（Prism，MIT），不执行（与 md 并存时 md 优先）
-	specialTagURL      = "url"  // 详情页（非 md）：正文中 http(s) URL 转为可点击链接
-	specialTagSafe     = "safe" // 经 HTTP（浏览器、chore 等）的列表/详情 JSON 与 HTML 均不展示正文；库内仍存全文，chore_svr 本地读库命令可查看
-	// 含 hide 标签的行：见 store.TagHide，HTTP 经 List/Search/GetVisibleHTTP 过滤；本地 CLI 传 excludeHideTag=false。
+	// specialTagMarkdown：详情页正文按 Markdown 渲染（通过 cdn.jsdelivr.net/npm/marked）。
+	// 解析失败或网络不可用时降级为纯文本展示。
+	specialTagMarkdown = "md"
+
+	// specialTagJSON：详情页渲染为可折叠 JSON 树 + 简易语法配色（服务端 encoding/json 解析）。
+	// 非合法 JSON 或含多段 JSON 时退回转义原文。与 md 并存时 md 优先。
+	specialTagJSON = "json"
+
+	// specialTagYAML：详情页渲染为可折叠 YAML 树（gopkg.in/yaml.v3，Apache-2.0）。
+	// 解析失败时退回转义原文。与 md 并存时 md 优先。
+	specialTagYAML = "yaml"
+
+	// specialTagSH：详情页对正文做 bash 语法高亮（Prism 1.29，MIT，按需从 CDN 加载）。
+	// 仅高亮展示，不在浏览器或服务端执行脚本。与 md 并存时 md 优先。
+	specialTagSH = "sh"
+
+	// specialTagURL：详情页（非 md 分支）将正文中 http(s):// URL 转为可点击链接。
+	// 其余内容仍做 HTML 转义展示。
+	specialTagURL = "url"
+
+	// specialTagSafe：经 HTTP 的列表/搜索/详情均不展示正文（HTML 占位 + JSON content 置空）。
+	// 数据库内仍保存完整正文，本地 chore_svr -i <id> 可查看。
+	specialTagSafe = "safe"
+
+	// hide 标签：见 store.TagHide。
+	// HTTP List/Search/GetVisibleHTTP 在 SQL 层过滤含该标签的行，客户端与浏览器完全看不到这些记录。
+	// 本地 CLI 传 excludeHideTag=false，仍可通过 -i/-q/-limit 访问。
+	_ = store.TagHide // 此处仅作交叉引用文档，逻辑在 store 层实现。
 )
 
-// pasteHasTag 判断逗号分隔的 tags 中是否存在指定内置标签名（trim 后精确匹配）
+// pasteHasTag 判断逗号分隔的 tags 字符串中是否包含精确匹配 name 的标签（对每个分段 trim 后比较）。
 func pasteHasTag(tags, name string) bool {
 	for _, part := range strings.Split(tags, ",") {
 		if strings.TrimSpace(part) == name {
@@ -37,19 +77,25 @@ func pasteHasTag(tags, name string) bool {
 	return false
 }
 
-// StoreGetter 按客户端名返回 Store，用于按名选择 sqlite（如 abc -> abc.db）
+// StoreGetter 按客户端名返回对应的 Store 实例。
+// 生产实现为 store.Manager；测试可注入 mock。
+// name 来自 HTTP 头 X-Client-Name，由 SanitizeClientName 过滤后作为数据库文件名（如 abc → abc.db）。
 type StoreGetter interface {
 	GetStore(name string) (*store.Store, error)
 }
 
+// Server 持有 StoreGetter，为所有 HTTP 路由提供处理方法。
+// 通过 New 创建，之后将各 Handle* 方法注册到 http.ServeMux。
 type Server struct {
 	storeGetter StoreGetter
 }
 
+// New 创建 Server，sg 通常传入 store.Manager 实例。
 func New(sg StoreGetter) *Server {
 	return &Server{storeGetter: sg}
 }
 
+// storeFor 从请求头 X-Client-Name 解析客户端名并返回对应 Store。
 func (s *Server) storeFor(r *http.Request) (*store.Store, error) {
 	name := r.Header.Get("X-Client-Name")
 	return s.storeGetter.GetStore(name)

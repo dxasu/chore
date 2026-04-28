@@ -1,3 +1,14 @@
+// Package server 的 format_tree.go 文件实现结构化数据（JSON/YAML）的服务端树渲染，
+// 以及详情页 JSON/YAML/Shell 格式共用的附加 CSS 样式。
+//
+// 渲染结果是纯 HTML 字符串，由 detailFormatRegistry 中的 renderDetailJSON/renderDetailYAML 调用后
+// 直接嵌入详情页 #content-area，无需前端解析库即可展示可折叠结构树。
+//
+// 树渲染规则：
+//   - map 键按字母升序排列，前 5 项默认展开；
+//   - 数组元素按下标，前 3 项默认展开；
+//   - 嵌套深度超过 formatTreeMaxDepth 时截断为「…」，防止极深结构卡住渲染；
+//   - 基础类型（string/number/bool/null）直接以对应 CSS class 的 <span> 展示。
 package server
 
 import (
@@ -12,9 +23,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// formatTreeMaxDepth 是树渲染的最大递归深度，超出时显示省略号，避免极深 JSON/YAML 卡住页面渲染。
 const formatTreeMaxDepth = 64
 
-// jsonDetailHTML 合法 JSON 则渲染可折叠 + 简易语法色；否则返回转义后的原文 pre。
+// jsonDetailHTML 将 content 作为 JSON 解析并渲染为可折叠树 HTML。
+// 使用 json.Decoder.UseNumber 保留原始数字字符串，避免大整数精度丢失。
+// 若解析失败或输入含多段 JSON（dec.More() 为真），退回 <pre> 转义原文。
 func jsonDetailHTML(content string) string {
 	raw := strings.TrimSpace(content)
 	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
@@ -29,7 +43,9 @@ func jsonDetailHTML(content string) string {
 	return `<div class="format-tree format-json">` + renderValueFoldable(v, 0) + `</div>`
 }
 
-// yamlDetailHTML 合法 YAML 则解析为树并折叠展示；失败则转义原文。
+// yamlDetailHTML 将 content 作为 YAML 解析并渲染为可折叠树 HTML。
+// 解析后经 normalizeYAMLRoot 统一 key 类型，再复用与 JSON 相同的 renderValueFoldable。
+// 解析失败时退回 <pre> 转义原文。
 func yamlDetailHTML(content string) string {
 	var v any
 	if err := yaml.Unmarshal([]byte(content), &v); err != nil {
@@ -39,7 +55,9 @@ func yamlDetailHTML(content string) string {
 	return `<div class="format-tree format-yaml">` + renderValueFoldable(v, 0) + `</div>`
 }
 
-// normalizeYAMLRoot 将 map[any]any 等转为 string key 的 map，便于统一渲染。
+// normalizeYAMLRoot 是 yaml.Unmarshal 结果的顶层归一化入口。
+// yaml.v3 对映射产生 map[string]any，但嵌套映射可能产生 map[any]any，
+// 此函数递归转换为统一的 map[string]any，保证 renderValueFoldable 的类型 switch 覆盖所有情况。
 func normalizeYAMLRoot(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
@@ -59,6 +77,11 @@ func normalizeYAMLRoot(v any) any {
 	}
 }
 
+// normalizeYAMLValue 递归处理 YAML 解析树中的每个节点：
+//   - map[string]any / map[any]any → map[string]any（key 统一 fmt.Sprint 转字符串）
+//   - []any → 递归处理每个元素
+//   - []byte（YAML binary）→ string
+//   - 其他类型原样返回（string、int、float64、bool、nil 等）
 func normalizeYAMLValue(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
@@ -85,6 +108,15 @@ func normalizeYAMLValue(v any) any {
 	}
 }
 
+// renderValueFoldable 将任意 Go 值递归渲染为带 <details> 折叠的 HTML 树字符串。
+// 被 jsonDetailHTML 与 yamlDetailHTML 共同调用，统一 JSON 和 YAML 的视觉风格。
+//
+// CSS class 约定（与 detailFormatTreeCSS 对应）：
+//   - .j-null .j-bool .j-num .j-str：标量类型配色
+//   - .j-key .j-idx：对象键与数组下标
+//   - .j-bracket：空集合字面量
+//   - .json-fold / .json-nested：可折叠容器与缩进层
+//   - .j-trunc：超深截断占位
 func renderValueFoldable(v any, depth int) string {
 	if depth > formatTreeMaxDepth {
 		return `<span class="j-trunc">…</span>`
@@ -153,6 +185,8 @@ func renderValueFoldable(v any, depth int) string {
 	}
 }
 
+// foldOpenAttr 返回 <details> 标签的 open 属性字符串（含前导空格）或空串。
+// 用于控制树节点的默认展开/折叠状态：对象前 5 项、数组前 3 项默认展开。
 func foldOpenAttr(open bool) string {
 	if open {
 		return ` open`
@@ -160,6 +194,8 @@ func foldOpenAttr(open bool) string {
 	return ""
 }
 
+// formatFloat 将 float64 格式化为简洁字符串（%g 格式），并做 HTML 转义。
+// NaN/Inf 等非常规浮点值通过 fmt.Sprint 兜底，避免 strconv 恐慌。
 func formatFloat(f float64) string {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return escapeHTML(fmt.Sprint(f))
@@ -168,7 +204,9 @@ func formatFloat(f float64) string {
 	return escapeHTML(s)
 }
 
-// detailFormatTreeCSS 为 JSON/YAML 树与 Shell 代码块补充样式（不含 Prism 主题，主题仅 sh 分支单独引入）。
+// detailFormatTreeCSS 返回 JSON/YAML 树与 Shell 代码块所需的附加内联 CSS 字符串。
+// 该字符串由 renderDetailJSON/renderDetailYAML/renderDetailShell 通过 detailBodyFragment.ExtraFormatCSS 注入页内 <style>。
+// Prism 主题（用于 sh 分支）单独通过 ExtraHead <link> 引入，不包含在此处。
 func detailFormatTreeCSS() string {
 	return `
     .content-formatted { white-space: normal !important; }

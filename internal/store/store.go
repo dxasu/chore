@@ -1,3 +1,11 @@
+// Package store 提供基于 SQLite 的 paste 持久化层。
+//
+// 每个"客户端名"（如可执行文件名 abc）对应一个独立的 SQLite 数据库文件（abc.db），
+// 由 Manager 统一管理和缓存。Store 封装对单个数据库的 CRUD 及搜索操作。
+//
+// 内置标签约定（与 server 包共用）：
+//   - TagHide：经 HTTP 接口的列表/搜索/详情查询不返回含该标签的行；
+//     本地 CLI 直连数据库时传 excludeHideTag=false 仍可看到。
 package store
 
 import (
@@ -12,11 +20,16 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// maxTags 是单条记录允许携带的最大标签数量，超出部分在 normalizeTags 时截断。
 const maxTags = 10
 
-// TagHide 内置标签：HTTP 列表/搜索/详情默认不返回含该标签的行；本地 CLI 调用 List/Search/Get 时传 excludeHideTag=false 仍可查看。
+// TagHide 是内置的隐藏标签字面量。
+// 经 HTTP 接口（列表/搜索/详情）查询时，含该标签的行不会出现在返回结果中。
+// 本地 CLI 直连数据库（chore_svr -i / -q / -limit）时传 excludeHideTag=false，仍可查看全部记录。
 const TagHide = "hide"
 
+// ErrDuplicateLatestContent 在上传内容与数据库中最新一条完全相同时返回，
+// 防止重复剪贴板内容产生冗余记录。
 var ErrDuplicateLatestContent = errors.New("duplicate latest content")
 
 // excludeHideTagSQL 排除 tags 中含独立 token TagHide 的行（与 normalizeTags 逗号分隔、有序存储一致）。
@@ -28,6 +41,9 @@ func excludeHideTagSQL() string {
 	)
 }
 
+// Paste 表示数据库中的一条 paste 记录，与 SQLite paste 表行一一对应。
+// Tags 由 normalizeTags 处理后存储：去重、最多 maxTags 个、按字符升序排列、逗号分隔。
+// 例如上传时传入 ["sh","safe"] 最终存储为 "safe,sh"。
 type Paste struct {
 	ID        int64     `json:"id"`
 	Title     string    `json:"title"`
@@ -38,10 +54,15 @@ type Paste struct {
 	UserAgent string    `json:"user_agent"`
 }
 
+// Store 封装对单个 SQLite 数据库的所有操作。
+// 通过 New 创建，关闭时调用 Close 释放底层连接。
+// 并发安全性由 database/sql 连接池保证，无需外部加锁。
 type Store struct {
 	db *sql.DB
 }
 
+// New 打开（或创建）位于 dbPath 的 SQLite 数据库，执行 schema 迁移后返回 Store。
+// dbPath 应为可写路径，如 "./chore.db"。
 func New(dbPath string) (*Store, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -57,6 +78,7 @@ func New(dbPath string) (*Store, error) {
 	return s, nil
 }
 
+// migrate 确保 paste 表及索引存在，并调用 ensureColumns 处理旧库的列缺失。
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS paste (
@@ -116,7 +138,8 @@ func (s *Store) ensureColumns() error {
 	return nil
 }
 
-// defaultTitle 取内容前 8 个字符作为默认标题
+// defaultTitle 在调用方未提供标题时，取内容前 8 个 Unicode 字符作为默认标题。
+// 若内容为空则返回空串，由上层决定是否保留空标题。
 func defaultTitle(content string) string {
 	r := []rune(strings.TrimSpace(content))
 	if len(r) == 0 {
@@ -128,7 +151,12 @@ func defaultTitle(content string) string {
 	return string(r)
 }
 
-// normalizeTags 去重、取最多 maxTags 个、按字符顺序排列，返回逗号分隔字符串
+// normalizeTags 对传入的标签切片做规范化，规则：
+//  1. 逐项 trim 空白，跳过空串和重复项；
+//  2. 截取最多 maxTags 个（超出部分丢弃）；
+//  3. 按字符升序排列后以逗号连接。
+//
+// 规范化后的字符串可直接存入数据库，也便于 excludeHideTagSQL 做前缀/后缀匹配。
 func normalizeTags(tags []string) string {
 	seen := make(map[string]bool)
 	var list []string
@@ -147,6 +175,9 @@ func normalizeTags(tags []string) string {
 	return strings.Join(list, ",")
 }
 
+// Add 写入一条新记录，返回自增 id 与写入时间。
+// 若 title 为空则自动取 content 前 8 个字符。tags 经 normalizeTags 规范化后存储。
+// 当新内容与数据库最新一条完全相同时，返回 ErrDuplicateLatestContent。
 func (s *Store) Add(ctx context.Context, content, title string, tags []string, clientIP, userAgent string) (int64, time.Time, error) {
 	var latest string
 	err := s.db.QueryRowContext(ctx, `SELECT content FROM paste ORDER BY created_at DESC, id DESC LIMIT 1`).Scan(&latest)
@@ -173,15 +204,20 @@ func (s *Store) Add(ctx context.Context, content, title string, tags []string, c
 	return id, now, err
 }
 
+// Get 按 id 查询单条记录，包含 TagHide 的记录同样返回（供本地 CLI 及内部 Update 调用）。
+// 记录不存在时返回 (nil, nil)。
 func (s *Store) Get(ctx context.Context, id int64) (*Paste, error) {
 	return s.getPaste(ctx, id, false)
 }
 
-// GetVisibleHTTP 供 HTTP 使用：含 hide 标签的记录视为不存在（返回 nil, nil）。
+// GetVisibleHTTP 供 HTTP 处理器使用：含 TagHide 标签的记录视为不存在，返回 (nil, nil)，
+// 使 HTTP 客户端和浏览器收到 404，与 List/Search 的过滤语义保持一致。
 func (s *Store) GetVisibleHTTP(ctx context.Context, id int64) (*Paste, error) {
 	return s.getPaste(ctx, id, true)
 }
 
+// getPaste 是 Get 与 GetVisibleHTTP 的共同实现。
+// excludeHideTag 为 true 时在 WHERE 条件后附加 excludeHideTagSQL()。
 func (s *Store) getPaste(ctx context.Context, id int64, excludeHideTag bool) (*Paste, error) {
 	suffix := ""
 	if excludeHideTag {
@@ -200,7 +236,10 @@ func (s *Store) getPaste(ctx context.Context, id int64, excludeHideTag bool) (*P
 	return &p, nil
 }
 
-// Update updates title and/or tags for the given id. Nil pointer means leave unchanged. Returns (true, nil) when updated, (false, nil) when not found.
+// Update 更新指定 id 记录的 title 和/或 tags。
+// 传入 nil 指针表示该字段保持不变；两个都为 nil 时调用方应提前检查并返回错误。
+// 记录不存在返回 (false, nil)，更新成功返回 (true, nil)。
+// 内部使用 Get（不过滤 hide），保证即使是隐藏记录也可被本地工具更新。
 func (s *Store) Update(ctx context.Context, id int64, title *string, tags *[]string) (updated bool, err error) {
 	p, err := s.Get(ctx, id)
 	if err != nil {
@@ -261,7 +300,8 @@ func (s *Store) List(ctx context.Context, offset, limit int, excludeHideTag bool
 	return list, total, rows.Err()
 }
 
-// Delete 删除指定 id 的记录，返回实际删除的行数（0 或 1）；不存在则返回 0。
+// Delete 删除指定 id 的记录，返回实际删除的行数（0 表示记录不存在，1 表示成功删除）。
+// 不过滤 hide 标签，本地 CLI 可以删除任意记录。
 func (s *Store) Delete(ctx context.Context, id int64) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM paste WHERE id = ?`, id)
 	if err != nil {
@@ -352,6 +392,7 @@ func (s *Store) Search(ctx context.Context, query string, offset, limit int, exc
 	return list, total, rows.Err()
 }
 
+// Close 关闭底层 SQLite 连接，Store 之后不可再使用。
 func (s *Store) Close() error {
 	return s.db.Close()
 }
