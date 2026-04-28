@@ -17,17 +17,27 @@ const scriptSetWindowRawFromEmbed = `
     (function(){ window.rawContent = document.getElementById('content-raw') ? JSON.parse(document.getElementById('content-raw').textContent) : ''; })();
   </script>`
 
-// detailFormatRegistry 顺序即优先级：靠前先匹配（与原先 else-if 一致）。
-var detailFormatRegistry = []struct {
+// detailFormatEntry 描述一种正文展示格式。detailFormatRegistry 的切片顺序即匹配优先级（与原先 else-if 链一致）。
+type detailFormatEntry struct {
+	name   string // 仅文档/调试，不参与逻辑
 	match  func(tags string) bool
 	render func(p *store.Paste) detailBodyFragment
-}{
-	{
-		match: looksLikeMarkdown,
-		render: func(p *store.Paste) detailBodyFragment {
-			return detailBodyFragment{
-				MetaNote: `<p class="meta">（Markdown 预览）</p>`,
-				FootScript: `
+}
+
+// detailFormatRegistry：自顶向下第一个 match(tags) 为 true 的条目生效；最后一项必须为默认（match 恒 true）。
+var detailFormatRegistry = []detailFormatEntry{
+	{name: "markdown", match: looksLikeMarkdown, render: renderDetailMarkdown},
+	{name: "json", match: func(tags string) bool { return pasteHasTag(tags, specialTagJSON) }, render: renderDetailJSON},
+	{name: "yaml", match: func(tags string) bool { return pasteHasTag(tags, specialTagYAML) }, render: renderDetailYAML},
+	{name: "shell", match: func(tags string) bool { return pasteHasTag(tags, specialTagSH) }, render: renderDetailShell},
+	{name: "url", match: func(tags string) bool { return pasteHasTag(tags, specialTagURL) }, render: renderDetailURL},
+	{name: "plain", match: func(tags string) bool { return true }, render: renderDetailPlain},
+}
+
+func renderDetailMarkdown(_ *store.Paste) detailBodyFragment {
+	return detailBodyFragment{
+		MetaNote: `<p class="meta">（Markdown 预览）</p>`,
+		FootScript: `
   <script>
     (function(){
       var rawContent = (function(){ var e = document.getElementById('content-raw'); return e ? JSON.parse(e.textContent) : ''; })();
@@ -48,43 +58,37 @@ var detailFormatRegistry = []struct {
       document.head.appendChild(s);
     })();
   </script>`,
-			}
-		},
-	},
-	{
-		match: func(tags string) bool { return pasteHasTag(tags, specialTagJSON) },
-		render: func(p *store.Paste) detailBodyFragment {
-			return detailBodyFragment{
-				MetaNote:         `<p class="meta">（JSON：可折叠树；非法或多段 JSON 时为转义原文）</p>`,
-				ContentInner:     jsonDetailHTML(p.Content),
-				ExtraFormatCSS:   detailFormatTreeCSS(),
-				ContentAreaClass: " content-formatted",
-				FootScript:       scriptSetWindowRawFromEmbed,
-			}
-		},
-	},
-	{
-		match: func(tags string) bool { return pasteHasTag(tags, specialTagYAML) },
-		render: func(p *store.Paste) detailBodyFragment {
-			return detailBodyFragment{
-				MetaNote:         `<p class="meta">（YAML：可折叠树；解析失败时为转义原文）</p>`,
-				ContentInner:     yamlDetailHTML(p.Content),
-				ExtraFormatCSS:   detailFormatTreeCSS(),
-				ContentAreaClass: " content-formatted",
-				FootScript:       scriptSetWindowRawFromEmbed,
-			}
-		},
-	},
-	{
-		match: func(tags string) bool { return pasteHasTag(tags, specialTagSH) },
-		render: func(p *store.Paste) detailBodyFragment {
-			return detailBodyFragment{
-				MetaNote:         `<p class="meta">（Shell：仅语法高亮，不会在浏览器或服务端执行）</p>`,
-				ContentInner:     `<pre><code class="language-bash">` + escapeHTML(p.Content) + `</code></pre>`,
-				ExtraFormatCSS:   detailFormatTreeCSS(),
-				ContentAreaClass: " content-formatted content-sh",
-				ExtraHead:        `  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">` + "\n",
-				FootScript: `
+	}
+}
+
+func renderDetailJSON(p *store.Paste) detailBodyFragment {
+	return detailBodyFragment{
+		MetaNote:         `<p class="meta">（JSON：可折叠树；非法或多段 JSON 时为转义原文）</p>`,
+		ContentInner:     jsonDetailHTML(p.Content),
+		ExtraFormatCSS:   detailFormatTreeCSS(),
+		ContentAreaClass: " content-formatted",
+		FootScript:       scriptSetWindowRawFromEmbed,
+	}
+}
+
+func renderDetailYAML(p *store.Paste) detailBodyFragment {
+	return detailBodyFragment{
+		MetaNote:         `<p class="meta">（YAML：可折叠树；解析失败时为转义原文）</p>`,
+		ContentInner:     yamlDetailHTML(p.Content),
+		ExtraFormatCSS:   detailFormatTreeCSS(),
+		ContentAreaClass: " content-formatted",
+		FootScript:       scriptSetWindowRawFromEmbed,
+	}
+}
+
+func renderDetailShell(p *store.Paste) detailBodyFragment {
+	return detailBodyFragment{
+		MetaNote:         `<p class="meta">（Shell：仅语法高亮，不会在浏览器或服务端执行）</p>`,
+		ContentInner:     `<pre><code class="language-bash">` + escapeHTML(p.Content) + `</code></pre>`,
+		ExtraFormatCSS:   detailFormatTreeCSS(),
+		ContentAreaClass: " content-formatted content-sh",
+		ExtraHead:        `  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">` + "\n",
+		FootScript: `
   <script>
     (function(){
       window.rawContent = document.getElementById('content-raw') ? JSON.parse(document.getElementById('content-raw').textContent) : '';
@@ -109,23 +113,19 @@ var detailFormatRegistry = []struct {
       next();
     })();
   </script>`,
-			}
-		},
-	},
-	{
-		match: func(tags string) bool { return pasteHasTag(tags, specialTagURL) },
-		render: func(p *store.Paste) detailBodyFragment {
-			return detailBodyFragment{
-				ContentInner: contentToHTML(p.Content),
-				FootScript:   scriptSetWindowRawFromEmbed,
-			}
-		},
-	},
-	{
-		match: func(tags string) bool { return true },
-		render: func(p *store.Paste) detailBodyFragment {
-			return detailBodyFragment{
-				FootScript: `
+	}
+}
+
+func renderDetailURL(p *store.Paste) detailBodyFragment {
+	return detailBodyFragment{
+		ContentInner: contentToHTML(p.Content),
+		FootScript:   scriptSetWindowRawFromEmbed,
+	}
+}
+
+func renderDetailPlain(_ *store.Paste) detailBodyFragment {
+	return detailBodyFragment{
+		FootScript: `
   <script>
     (function(){
       var e = document.getElementById('content-raw');
@@ -136,9 +136,7 @@ var detailFormatRegistry = []struct {
       window.rawContent = rawContent;
     })();
   </script>`,
-			}
-		},
-	},
+	}
 }
 
 func detailBodyForSafeHidden() detailBodyFragment {
@@ -163,5 +161,5 @@ func selectDetailBodyByTags(p *store.Paste) detailBodyFragment {
 			return e.render(p)
 		}
 	}
-	return detailBodyFragment{}
+	panic("chore: detailFormatRegistry must end with a default entry (match always true)")
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -13,7 +14,19 @@ import (
 
 const maxTags = 10
 
+// TagHide 内置标签：HTTP 列表/搜索/详情默认不返回含该标签的行；本地 CLI 调用 List/Search/Get 时传 excludeHideTag=false 仍可查看。
+const TagHide = "hide"
+
 var ErrDuplicateLatestContent = errors.New("duplicate latest content")
+
+// excludeHideTagSQL 排除 tags 中含独立 token TagHide 的行（与 normalizeTags 逗号分隔、有序存储一致）。
+func excludeHideTagSQL() string {
+	h := TagHide
+	return fmt.Sprintf(
+		` AND NOT (tags = '%[1]s' OR tags LIKE '%[1]s,%%' OR tags LIKE '%%%,%[1]s,%%' OR tags LIKE '%%%%,%[1]s')`,
+		h,
+	)
+}
 
 type Paste struct {
 	ID        int64     `json:"id"`
@@ -161,9 +174,22 @@ func (s *Store) Add(ctx context.Context, content, title string, tags []string, c
 }
 
 func (s *Store) Get(ctx context.Context, id int64) (*Paste, error) {
+	return s.getPaste(ctx, id, false)
+}
+
+// GetVisibleHTTP 供 HTTP 使用：含 hide 标签的记录视为不存在（返回 nil, nil）。
+func (s *Store) GetVisibleHTTP(ctx context.Context, id int64) (*Paste, error) {
+	return s.getPaste(ctx, id, true)
+}
+
+func (s *Store) getPaste(ctx context.Context, id int64, excludeHideTag bool) (*Paste, error) {
+	suffix := ""
+	if excludeHideTag {
+		suffix = excludeHideTagSQL()
+	}
 	var p Paste
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, title, tags, content, created_at, client_ip, user_agent FROM paste WHERE id = ?`, id,
+		`SELECT id, title, tags, content, created_at, client_ip, user_agent FROM paste WHERE id = ?`+suffix, id,
 	).Scan(&p.ID, &p.Title, &p.Tags, &p.Content, &p.CreatedAt, &p.ClientIP, &p.UserAgent)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -199,20 +225,25 @@ func (s *Store) Update(ctx context.Context, id int64, title *string, tags *[]str
 }
 
 // List 分页列出历史记录，按 created_at 倒序。offset/limit 为分页参数，返回本页列表与总数。
-func (s *Store) List(ctx context.Context, offset, limit int) ([]*Paste, int64, error) {
+// excludeHideTag 为 true 时不返回 tags 中含 hide 的行（供 Web/远程客户端）；本地工具传 false 查看全部。
+func (s *Store) List(ctx context.Context, offset, limit int, excludeHideTag bool) ([]*Paste, int64, error) {
 	if limit <= 0 {
 		limit = 20
 	}
 	if limit > 100 {
 		limit = 100
 	}
+	hideSQL := ""
+	if excludeHideTag {
+		hideSQL = excludeHideTagSQL()
+	}
 	var total int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM paste`).Scan(&total)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM paste WHERE 1=1`+hideSQL).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, title, tags, content, created_at, client_ip, user_agent FROM paste ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+		`SELECT id, title, tags, content, created_at, client_ip, user_agent FROM paste WHERE 1=1`+hideSQL+` ORDER BY created_at DESC LIMIT ? OFFSET ?`,
 		limit, offset,
 	)
 	if err != nil {
@@ -241,7 +272,8 @@ func (s *Store) Delete(ctx context.Context, id int64) (int64, error) {
 }
 
 // Search 按标题、内容或标签模糊搜索，按 created_at 倒序，最多返回 limit 条（内部限制最大 20）。返回本页列表与匹配总数。
-func (s *Store) Search(ctx context.Context, query string, offset, limit int) ([]*Paste, int64, error) {
+// excludeHideTag 为 true 时匹配结果中再排除含 hide 标签的行（供 Web/远程客户端）。
+func (s *Store) Search(ctx context.Context, query string, offset, limit int, excludeHideTag bool) ([]*Paste, int64, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -287,16 +319,22 @@ func (s *Store) Search(ctx context.Context, query string, offset, limit int) ([]
 		whereArgs = []any{pattern, pattern, pattern}
 	}
 
+	hideSQL := ""
+	if excludeHideTag {
+		hideSQL = excludeHideTagSQL()
+	}
+	fullWhere := "(" + whereClause + ")" + hideSQL
+
 	var total int64
 	countArgs := append([]any{}, whereArgs...)
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM paste WHERE `+whereClause, countArgs...).Scan(&total)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM paste WHERE `+fullWhere, countArgs...).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
 	listArgs := append([]any{}, whereArgs...)
 	listArgs = append(listArgs, limit, offset)
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, title, tags, content, created_at, client_ip, user_agent FROM paste WHERE `+whereClause+` ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+		`SELECT id, title, tags, content, created_at, client_ip, user_agent FROM paste WHERE `+fullWhere+` ORDER BY created_at DESC LIMIT ? OFFSET ?`,
 		listArgs...,
 	)
 	if err != nil {

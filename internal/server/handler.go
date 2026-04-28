@@ -24,6 +24,7 @@ const (
 	specialTagSH       = "sh"   // 详情页：Shell 脚本仅 bash 语法高亮（Prism，MIT），不执行（与 md 并存时 md 优先）
 	specialTagURL      = "url"  // 详情页（非 md）：正文中 http(s) URL 转为可点击链接
 	specialTagSafe     = "safe" // 经 HTTP（浏览器、chore 等）的列表/详情 JSON 与 HTML 均不展示正文；库内仍存全文，chore_svr 本地读库命令可查看
+	// 含 hide 标签的行：见 store.TagHide，HTTP 经 List/Search/GetVisibleHTTP 过滤；本地 CLI 传 excludeHideTag=false。
 )
 
 // pasteHasTag 判断逗号分隔的 tags 中是否存在指定内置标签名（trim 后精确匹配）
@@ -210,13 +211,13 @@ func (s *Server) HandleList(w http.ResponseWriter, r *http.Request) {
 		total int64
 	)
 	if q != "" {
-		list, total, err = st.Search(r.Context(), q, offset, perPage)
+		list, total, err = st.Search(r.Context(), q, offset, perPage, true)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	} else {
-		list, total, err = st.List(r.Context(), offset, perPage)
+		list, total, err = st.List(r.Context(), offset, perPage, true)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -286,7 +287,7 @@ func (s *Server) HandleDetail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	p, err := st.Get(r.Context(), id)
+	p, err := st.GetVisibleHTTP(r.Context(), id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

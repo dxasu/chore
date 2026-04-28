@@ -148,6 +148,7 @@ API when running as server (no -i/-q/-limit):
   PATCH  /api/paste/:id    update title and/or tags (Body: JSON {"title":"...", "tags":["a","b"]})
   GET    /list /list/:name history list + search (q=...; paginated)
   GET    /detail/:name/:id single item detail
+  (tags 含 "hide" 的记录仅 HTTP 列表/搜索/详情不返回；本工具 -i/-q/-limit 直连库仍可见)
 `)
 	}
 	flag.Parse()
@@ -252,7 +253,7 @@ API when running as server (no -i/-q/-limit):
 		if err != nil {
 			log.Fatalf("open DB %s: %v", resolvedName, err)
 		}
-		list, total, err := st.Search(context.Background(), *q, 0, searchLimit)
+		list, total, err := st.Search(context.Background(), *q, 0, searchLimit, false)
 		if err != nil {
 			log.Fatalf("search: %v", err)
 		}
@@ -271,7 +272,7 @@ API when running as server (no -i/-q/-limit):
 		if err != nil {
 			log.Fatalf("open DB %s: %v", resolvedName, err)
 		}
-		list, total, err := st.List(context.Background(), 0, *limit)
+		list, total, err := st.List(context.Background(), 0, *limit, false)
 		if err != nil {
 			log.Fatalf("list: %v", err)
 		}
