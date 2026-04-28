@@ -19,6 +19,13 @@ import (
 // Override at build time with -ldflags "-X main.defaultServerURL=..."
 var defaultServerURL = "http://localhost:2026"
 
+// 编译时通过 -ldflags 注入
+var (
+	buildTime = "unknown"
+	commitID  = "unknown"
+	gitTag    = ""
+)
+
 // expandShortArgs expands combined short flags.
 // Supports:
 // - bool-only cluster: -voc -> -v -o -c
@@ -75,6 +82,14 @@ func expandShortArgs(args []string, boolFlags, valueFlags map[rune]bool) []strin
 	return out
 }
 
+func printVersion() {
+	if gitTag != "" {
+		fmt.Printf("tag:    %s\n", gitTag)
+	}
+	fmt.Printf("commit: %s\n", commitID)
+	fmt.Printf("built:  %s\n", buildTime)
+}
+
 func main() {
 	serverURL := flag.String("s", defaultServerURL, "chore_svr server URL")
 	verbose := flag.Bool("v", false, "on success print detail and list URLs")
@@ -83,6 +98,7 @@ func main() {
 	cp := flag.Bool("c", false, "with -i: copy content to clipboard instead of stdout")
 	title := flag.String("title", "", "optional title for the paste")
 	tags := flag.String("tags", "", "optional comma-separated tags (max 10)")
+	version := flag.Bool("version", false, "print build info and exit")
 	flag.Usage = func() {
 		name := clientNameFromExec()
 		fmt.Fprintf(os.Stderr, "%s - send clipboard to chore_svr, one DB per executable name (e.g. abc -> abc.db)\n\nUsage:\n  %s [options]\n\nOptions:\n", name, name)
@@ -99,6 +115,11 @@ func main() {
 	})
 	if err := flag.CommandLine.Parse(expandedArgs[1:]); err != nil {
 		fail("parse flags: %v", err)
+	}
+
+	if *version {
+		printVersion()
+		return
 	}
 
 	clientName := clientNameFromExec()

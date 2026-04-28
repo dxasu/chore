@@ -20,6 +20,13 @@ import (
 // Override at build time with -ldflags "-X main.defaultAddr=..."
 var defaultAddr = ":2026"
 
+// 编译时通过 -ldflags 注入
+var (
+	buildTime = "unknown"
+	commitID  = "unknown"
+	gitTag    = ""
+)
+
 type localConfig struct {
 	Name string `json:"name"`
 }
@@ -114,6 +121,14 @@ func resolveName(cliName string, cfg localConfig) string {
 	return serviceNameFromExec()
 }
 
+func printVersion() {
+	if gitTag != "" {
+		fmt.Printf("tag:    %s\n", gitTag)
+	}
+	fmt.Printf("commit: %s\n", commitID)
+	fmt.Printf("built:  %s\n", buildTime)
+}
+
 func main() {
 	addr := flag.String("addr", defaultAddr, "listen address (server mode only)")
 	dbDir := flag.String("dbDir", "./", "directory for sqlite DBs, one per client name (e.g. abc.db)")
@@ -125,6 +140,7 @@ func main() {
 	tags := flag.String("tags", "", "with -i: set tags, comma-separated (update mode, single id)")
 	q := flag.String("q", "", "local search by content and print, then exit")
 	limit := flag.Int("limit", 0, "with -q: max results; without -q: show last N items")
+	version := flag.Bool("version", false, "print build info and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `chore_svr - receive paste from chore, store per-client sqlite; or use as local delete/search/list/update tool
 
@@ -152,6 +168,12 @@ API when running as server (no -i/-q/-limit):
 `)
 	}
 	flag.Parse()
+
+	if *version {
+		printVersion()
+		return
+	}
+
 	cfg, err := loadConfig("chore.json")
 	if err != nil {
 		log.Fatalf("load config chore.json: %v", err)
