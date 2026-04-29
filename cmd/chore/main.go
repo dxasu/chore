@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/atotto/clipboard"
 )
@@ -103,7 +105,7 @@ func main() {
 		name := clientNameFromExec()
 		fmt.Fprintf(os.Stderr, "%s - send clipboard to chore_svr, one DB per executable name (e.g. abc -> abc.db)\n\nUsage:\n  %s [options]\n\nOptions:\n", name, name)
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nExamples:\n  %s                 read clipboard and upload\n  %s -v              print detail URL and list URL\n  %s -o              open browser to list page\n  %s -i 5            get and print content of paste #5\n  %s -i 5 -c         get content of paste #5 and copy it\n  %s -vc             combined short bool flags (equivalent to -v -c)\n  %s -icv 5          mixed short flags (equivalent to -c -v -i 5)\n  %s -title \"Note\" -tags a,b,c  upload with optional title and tags\n  %s -s http://host:9000         use custom server\n", name, name, name, name, name, name, name, name, name)
+		fmt.Fprintf(os.Stderr, "\nExamples:\n  %s                 read clipboard and upload (text or image)\n  %s -v              print detail URL and list URL\n  %s -o              open browser to list page\n  %s -i 5            get and print content of paste #5\n  %s -i 5 -c         get content of paste #5 and copy it\n  %s -vc             combined short bool flags (equivalent to -v -c)\n  %s -icv 5          mixed short flags (equivalent to -c -v -i 5)\n  %s -title \"Note\" -tags a,b,c  upload with optional title and tags\n  %s -s http://host:9000         use custom server\n", name, name, name, name, name, name, name, name, name)
 	}
 	expandedArgs := expandShortArgs(os.Args, map[rune]bool{
 		'v': true,
@@ -167,26 +169,40 @@ func main() {
 		return
 	}
 
-	content, err := clipboard.ReadAll()
-	if err != nil {
-		fail("read clipboard: %v", err)
+	// 尝试读文字剪贴板
+	textContent, textErr := clipboard.ReadAll()
+	if textErr == nil && trimSpace(textContent) != "" {
+		uploadText(baseURL, clientName, *serverURL, trimSpace(textContent), *title, *tags, *verbose)
+		return
 	}
 
-	content = trimSpace(content)
-	if content == "" {
-		fail("clipboard is empty")
+	// 尝试读图片剪贴板
+	imgData, imgErr := readClipboardImage()
+	if imgErr != nil {
+		fail("read image from clipboard: %v", imgErr)
+	}
+	if imgData != nil {
+		uploadImage(baseURL, clientName, *serverURL, imgData, *title, *tags, *verbose)
+		return
 	}
 
+	// 既不是文字也不是图片
+	desc := describeClipboard()
+	fail("clipboard contains unsupported content\nfound: %s", desc)
+}
+
+// uploadText 将文字内容 POST 到 /api/paste 并打印结果。
+func uploadText(baseURL, clientName, serverURL, content, titleFlag, tagsFlag string, verbose bool) {
 	payload := struct {
 		Content string   `json:"content"`
 		Title   string   `json:"title,omitempty"`
 		Tags    []string `json:"tags,omitempty"`
 	}{
 		Content: content,
-		Title:   strings.TrimSpace(*title),
+		Title:   strings.TrimSpace(titleFlag),
 	}
-	if *tags != "" {
-		for _, t := range strings.Split(*tags, ",") {
+	if tagsFlag != "" {
+		for _, t := range strings.Split(tagsFlag, ",") {
 			if s := strings.TrimSpace(t); s != "" {
 				payload.Tags = append(payload.Tags, s)
 			}
@@ -208,27 +224,127 @@ func main() {
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		fail("server returned %d: %s", resp.StatusCode, string(b))
+		fail("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	printUploadResult(resp.Body, serverURL, verbose)
+}
+
+// uploadImage 将 PNG 字节 POST 到 /api/image 并打印结果。
+func uploadImage(baseURL, clientName, serverURL string, imgData []byte, titleFlag, tagsFlag string, verbose bool) {
+	endpoint := baseURL + "/api/image"
+	params := url.Values{}
+	if t := strings.TrimSpace(titleFlag); t != "" {
+		params.Set("title", t)
+	}
+	if tagsFlag != "" {
+		params.Set("tags", tagsFlag)
+	}
+	if len(params) > 0 {
+		endpoint += "?" + params.Encode()
 	}
 
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(imgData))
+	if err != nil {
+		fail("build image request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Client-Name", clientName)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fail("image upload request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		fail("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	printUploadResult(resp.Body, serverURL, verbose)
+}
+
+// printUploadResult 解析上传响应并在 verbose 模式下打印详情。
+func printUploadResult(body io.Reader, serverURL string, verbose bool) {
 	var out struct {
 		ID        int64  `json:"id"`
 		CreatedAt string `json:"created_at"`
 		DetailURL string `json:"detail_url"`
 		ListURL   string `json:"list_url"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(body).Decode(&out); err != nil {
 		fail("decode response: %v", err)
 	}
-
-	if !*verbose {
-		// fmt.Println(out.ID)
+	if !verbose {
 		return
 	}
 	fmt.Printf("saved #%d %s\n", out.ID, out.CreatedAt)
-	fmt.Printf("detail: %s%s\n", *serverURL, out.DetailURL)
+	fmt.Printf("detail: %s%s\n", serverURL, out.DetailURL)
 	if out.ListURL != "" {
-		fmt.Printf("list: %s%s\n", *serverURL, out.ListURL)
+		fmt.Printf("list: %s%s\n", serverURL, out.ListURL)
+	}
+}
+
+// readClipboardImage 尝试从剪贴板读取 PNG 图片字节。
+// 返回 (nil, nil) 表示剪贴板中没有图片（不是错误）。
+func readClipboardImage() ([]byte, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return readClipboardImageMac()
+	case "linux":
+		return readClipboardImageLinux()
+	default:
+		return nil, nil
+	}
+}
+
+// readClipboardImageMac 用 AppleScript 将剪贴板 PNG 写入临时文件后读取。
+func readClipboardImageMac() ([]byte, error) {
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("chore_clip_%d.png", time.Now().UnixNano()))
+	script := `try
+	set imgData to the clipboard as «class PNGf»
+	set fd to open for access POSIX file "` + tmpFile + `" with write permission
+	set eof of fd to 0
+	write imgData to fd
+	close access fd
+	return "ok"
+on error
+	return "no"
+end try`
+	out, err := exec.Command("osascript", "-e", script).Output()
+	if err != nil {
+		return nil, nil // osascript 不可用，当作无图片
+	}
+	if strings.TrimSpace(string(out)) != "ok" {
+		return nil, nil
+	}
+	defer os.Remove(tmpFile)
+	return os.ReadFile(tmpFile)
+}
+
+// readClipboardImageLinux 尝试用 xclip 读取剪贴板中的 PNG。
+func readClipboardImageLinux() ([]byte, error) {
+	out, err := exec.Command("xclip", "-selection", "clipboard", "-t", "image/png", "-o").Output()
+	if err != nil || len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// describeClipboard 返回剪贴板当前内容类型的描述，用于不支持的内容类型的错误提示。
+func describeClipboard() string {
+	switch runtime.GOOS {
+	case "darwin":
+		out, err := exec.Command("osascript", "-e", `clipboard info`).Output()
+		if err != nil {
+			return "unknown (osascript failed)"
+		}
+		info := strings.TrimSpace(string(out))
+		if info == "" {
+			return "empty"
+		}
+		return info
+	default:
+		return fmt.Sprintf("unknown (unsupported platform: %s)", runtime.GOOS)
 	}
 }
 
@@ -238,14 +354,14 @@ func fail(format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-func openBrowser(url string) error {
+func openBrowser(rawURL string) error {
 	switch runtime.GOOS {
 	case "darwin":
-		return exec.Command("open", url).Start()
+		return exec.Command("open", rawURL).Start()
 	case "windows":
-		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL).Start()
 	default:
-		return exec.Command("xdg-open", url).Start()
+		return exec.Command("xdg-open", rawURL).Start()
 	}
 }
 

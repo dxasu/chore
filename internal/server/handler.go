@@ -1,27 +1,35 @@
 // Package server 实现 chore HTTP 服务的全部路由处理器与 HTML 页面渲染。
 //
 // 路由概览（由 cmd/chore_svr/main.go 注册）：
-//   - POST /api/paste          上传新记录（纯文本或 JSON body）
+//   - POST /api/paste          上传文字记录（纯文本或 JSON body）
+//   - POST /api/image          上传 PNG 图片（raw body；文件存 {dbDir}/{name}.img/，路径写入 content）
 //   - PATCH /api/paste/:id     更新 title/tags（JSON body）
 //   - GET  /list[/:name]       分页历史列表，支持 q=... 搜索
 //   - GET  /search[/:name]     兼容旧链接，301 重定向到 /list
 //   - GET  /detail/:name/:id   单条记录详情页
+//   - GET  /img/:name/:file    提供已上传图片文件
 //
 // 内置标签语义（详见常量块）：
 //   - safe：HTTP 列表/详情隐藏正文（store 仍存全文）
 //   - hide：HTTP 列表/搜索/详情完全过滤该行（store.TagHide）
+//   - png：content 为图片 Web 路径，详情页以 <img> 展示；上传图片时自动添加
 //   - md / json / yaml / sh / url：详情页正文渲染格式（由 detailFormatRegistry 驱动）
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"chore/internal/store"
 )
@@ -61,6 +69,10 @@ const (
 	// 数据库内仍保存完整正文，本地 chore_svr -i <id> 可查看。
 	specialTagSafe = "safe"
 
+	// specialTagPNG：记录内容为服务器上的图片路径（/img/{name}/{file}），详情页以 <img> 展示。
+	// 上传图片时由客户端自动添加；非图片内容请勿手动添加该标签。
+	specialTagPNG = "png"
+
 	// hide 标签：见 store.TagHide。
 	// HTTP List/Search/GetVisibleHTTP 在 SQL 层过滤含该标签的行，客户端与浏览器完全看不到这些记录。
 	// 本地 CLI 传 excludeHideTag=false，仍可通过 -i/-q/-limit 访问。
@@ -88,12 +100,23 @@ type StoreGetter interface {
 // 通过 New 创建，之后将各 Handle* 方法注册到 http.ServeMux。
 type Server struct {
 	storeGetter StoreGetter
+	imgRoot     string // 图片存储根目录，子目录按客户端名划分
 }
 
-// New 创建 Server，sg 通常传入 store.Manager 实例。
-func New(sg StoreGetter) *Server {
-	return &Server{storeGetter: sg}
+// New 创建 Server，sg 通常传入 store.Manager 实例，imgRoot 为图片存储根目录（通常与 dbDir 相同）。
+func New(sg StoreGetter, imgRoot string) *Server {
+	return &Server{storeGetter: sg, imgRoot: imgRoot}
 }
+
+// imgDirSuffix 是图片存储子目录的固定后缀，与 SQLite 文件的 ".db" 后缀对应，
+// 例如客户端名 "abc" 对应图片目录 "abc.img"、数据库文件 "abc.db"。
+const imgDirSuffix = ".img"
+
+// safeFilenameRe 只允许字母、数字、下划线、连字符与后缀点，防止路径穿越。
+var safeFilenameRe = regexp.MustCompile(`^[a-zA-Z0-9_\-]+\.[a-z]+$`)
+
+// pngMagic 是 PNG 文件的固定魔数字节序列。
+var pngMagic = []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
 
 // storeFor 从请求头 X-Client-Name 解析客户端名并返回对应 Store。
 func (s *Server) storeFor(r *http.Request) (*store.Store, error) {
@@ -168,6 +191,132 @@ func (s *Server) HandlePaste(w http.ResponseWriter, r *http.Request) {
 		"detail_url": "/detail/" + nameForURL + "/" + strconv.FormatInt(id, 10),
 		"list_url":   "/list/" + nameForURL,
 	})
+}
+
+// HandleImage 处理 POST /api/image 请求，接收原始 PNG 字节流（Content-Type: application/octet-stream），
+// 保存到 {imgRoot}/{clientName}.img/{timestamp}.png（目录命名与 {clientName}.db 对应），并将 Web 路径写入 SQLite。
+// Query: title=...&tags=a,b,c（可选；title 默认 "png"，tags 自动补充 "png"）。
+// Header: X-Client-Name 决定子目录与 DB 名。
+func (s *Server) HandleImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.imgRoot == "" {
+		http.Error(w, "image storage not configured", http.StatusNotImplemented)
+		return
+	}
+
+	clientName := store.SanitizeClientName(r.Header.Get("X-Client-Name"))
+
+	title := strings.TrimSpace(r.URL.Query().Get("title"))
+	if title == "" {
+		title = "png"
+	}
+	var tags []string
+	if t := r.URL.Query().Get("tags"); t != "" {
+		for _, v := range strings.Split(t, ",") {
+			if s := strings.TrimSpace(v); s != "" {
+				tags = append(tags, s)
+			}
+		}
+	}
+	hasPNG := false
+	for _, tag := range tags {
+		if tag == specialTagPNG {
+			hasPNG = true
+			break
+		}
+	}
+	if !hasPNG {
+		tags = append(tags, specialTagPNG)
+	}
+
+	const maxSize = 10 << 20 // 10 MB
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxSize+1))
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxSize {
+		http.Error(w, "image too large (max 10 MB)", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if len(body) < 8 || !bytes.HasPrefix(body, pngMagic) {
+		http.Error(w, "invalid PNG: magic bytes mismatch", http.StatusBadRequest)
+		return
+	}
+
+	imgDir := filepath.Join(s.imgRoot, clientName+imgDirSuffix)
+	if err := os.MkdirAll(imgDir, 0o755); err != nil {
+		http.Error(w, "create image dir: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	filename := time.Now().Format("20060102150405") + ".png"
+	imgPath := filepath.Join(imgDir, filename)
+	if err := os.WriteFile(imgPath, body, 0o644); err != nil {
+		http.Error(w, "write image: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// content 存储图片的 Web 访问路径，详情页直接用作 <img src>
+	content := "/img/" + clientName + "/" + filename
+
+	st, err := s.storeFor(r)
+	if err != nil {
+		os.Remove(imgPath)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	clientIP := clientIP(r)
+	userAgent := r.UserAgent()
+	id, createdAt, err := st.Add(r.Context(), content, title, tags, clientIP, userAgent)
+	if err != nil {
+		os.Remove(imgPath)
+		if errors.Is(err, store.ErrDuplicateLatestContent) {
+			http.Error(w, "duplicate latest content", http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	nameForURL := store.SanitizeClientName(r.Header.Get("X-Client-Name"))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"id":         id,
+		"created_at": createdAt.Format("2006-01-02 15:04:05"),
+		"detail_url": "/detail/" + nameForURL + "/" + strconv.FormatInt(id, 10),
+		"list_url":   "/list/" + nameForURL,
+	})
+}
+
+// HandleServeImage 处理 GET /img/:name/:filename，提供已上传的图片文件。
+func (s *Server) HandleServeImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.imgRoot == "" {
+		http.NotFound(w, r)
+		return
+	}
+	pathRest := strings.TrimPrefix(r.URL.Path, "/img/")
+	pathRest = strings.Trim(pathRest, "/")
+	parts := strings.SplitN(pathRest, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	clientName := store.SanitizeClientName(parts[0])
+	filename := parts[1]
+	if !safeFilenameRe.MatchString(filename) {
+		http.Error(w, "invalid filename", http.StatusBadRequest)
+		return
+	}
+	imgPath := filepath.Join(s.imgRoot, clientName+imgDirSuffix, filename)
+	http.ServeFile(w, r, imgPath)
 }
 
 // PATCH /api/paste/:id — update title and/or tags. Body: JSON {"title": "...", "tags": ["a","b"]}, omit fields to leave unchanged.

@@ -315,9 +315,11 @@ API when running as server (no -i/-q/-limit):
 			next(w, r)
 		}
 	}
-	h := server.New(manager)
+	h := server.New(manager, *dbDir)
 	http.HandleFunc("/api/paste", logRequest(h.HandlePaste))
 	http.HandleFunc("/api/paste/", logRequest(h.HandlePatchPaste))
+	http.HandleFunc("/api/image", logRequest(h.HandleImage))
+	http.HandleFunc("/img/", h.HandleServeImage)
 	http.HandleFunc("/list", logRequest(h.HandleList))
 	http.HandleFunc("/list/", logRequest(h.HandleList))
 	http.HandleFunc("/detail/", logRequest(h.HandleDetail))

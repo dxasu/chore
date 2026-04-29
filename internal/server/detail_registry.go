@@ -8,6 +8,7 @@
 //	  1. 实现一个 renderDetailXxx(*store.Paste) detailBodyFragment 函数；
 //	  2. 在 detailFormatRegistry 中、plain 之前插入一行。
 //
+// 当前注册顺序（即优先级，高 → 低）：png > md > json > yaml > sh > url > plain。
 // safe 标签（访问控制）由 detailPage 在进入注册表之前提前处理，与格式渲染解耦。
 package server
 
@@ -66,8 +67,9 @@ type detailFormatEntry struct {
 // 匹配规则：自顶向下扫描，第一个 match(tags)==true 的条目生效，其余跳过（类似 if-else if 链）。
 // 最后一项 plain 的 match 恒为 true，作为默认兜底，必须保留在末尾。
 //
-// 当前顺序（即优先级）：markdown > json > yaml > shell > url > plain。
+// 当前顺序（即优先级）：png > markdown > json > yaml > shell > url > plain。
 var detailFormatRegistry = []detailFormatEntry{
+	{name: "png", match: func(tags string) bool { return pasteHasTag(tags, specialTagPNG) }, render: renderDetailPNG},
 	{name: "markdown", match: looksLikeMarkdown, render: renderDetailMarkdown},
 	{name: "json", match: func(tags string) bool { return pasteHasTag(tags, specialTagJSON) }, render: renderDetailJSON},
 	{name: "yaml", match: func(tags string) bool { return pasteHasTag(tags, specialTagYAML) }, render: renderDetailYAML},
@@ -196,6 +198,22 @@ func renderDetailPlain(_ *store.Paste) detailBodyFragment {
       el.style.whiteSpace = 'pre-wrap';
       window.rawContent = rawContent;
     })();
+  </script>`,
+	}
+}
+
+// renderDetailPNG 渲染图片格式：
+// content 字段存储图片 Web 路径（/img/{name}/{file}），直接嵌入 <img> 展示。
+// 复制按钮不展示正文（图片路径对用户无意义），window.rawContent 置为空串。
+func renderDetailPNG(p *store.Paste) detailBodyFragment {
+	imgURL := escapeHTMLAttr(p.Content)
+	return detailBodyFragment{
+		MetaNote:         `<p class="meta">（图片）</p>`,
+		ContentInner:     `<img src="` + imgURL + `" style="max-width:100%;height:auto;display:block;border-radius:8px;" alt="uploaded image">`,
+		ContentAreaClass: " content-png",
+		FootScript: `
+  <script>
+    (function(){ window.rawContent = ''; })();
   </script>`,
 	}
 }
