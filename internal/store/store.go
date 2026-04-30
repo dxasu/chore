@@ -263,6 +263,34 @@ func (s *Store) Update(ctx context.Context, id int64, title *string, tags *[]str
 	return true, nil
 }
 
+// searchFilter 表示一条解析后的搜索条件。
+type searchFilter struct {
+	field string // "title" | "content" | "tags"
+	value string
+}
+
+// parseSearchQuery 将查询字符串拆分为多个 searchFilter，空格为分隔符。
+// 识别 "field:value" 格式（field 为 title/content/tags，大小写不敏感）；
+// 无前缀的 token 归为 "content"（按正文模糊匹配）。
+// 所有 filter 最终以 AND 连接。
+func parseSearchQuery(query string) []searchFilter {
+	var out []searchFilter
+	for _, tok := range strings.Fields(query) {
+		if idx := strings.Index(tok, ":"); idx > 0 {
+			key := strings.ToLower(tok[:idx])
+			val := tok[idx+1:]
+			if val != "" && (key == "title" || key == "content" || key == "tags") {
+				out = append(out, searchFilter{field: key, value: val})
+				continue
+			}
+		}
+		if tok != "" {
+			out = append(out, searchFilter{field: "content", value: tok})
+		}
+	}
+	return out
+}
+
 // List 分页列出历史记录，按 created_at 倒序。offset/limit 为分页参数，返回本页列表与总数。
 // excludeHideTag 为 true 时不返回 tags 中含 hide 的行（供 Web/远程客户端）；本地工具传 false 查看全部。
 func (s *Store) List(ctx context.Context, offset, limit int, excludeHideTag bool) ([]*Paste, int64, error) {
@@ -313,6 +341,14 @@ func (s *Store) Delete(ctx context.Context, id int64) (int64, error) {
 
 // Search 按标题、内容或标签模糊搜索，按 created_at 倒序，最多返回 limit 条（内部限制最大 20）。返回本页列表与匹配总数。
 // excludeHideTag 为 true 时匹配结果中再排除含 hide 标签的行（供 Web/远程客户端）。
+//
+// query 支持空格分隔的多条件组合，所有条件 AND 连接，例如：
+//
+//	"tags:url title:mi content:hello"
+//	"golang tags:md"        // 无前缀 token 匹配所有字段（title OR content OR tags）
+//
+// 支持的字段前缀：title: content: tags:（大小写不敏感）。
+// 同一字段可重复出现（多值 AND），无前缀 token 全文匹配。
 func (s *Store) Search(ctx context.Context, query string, offset, limit int, excludeHideTag bool) ([]*Paste, int64, error) {
 	if limit <= 0 {
 		limit = 20
@@ -325,39 +361,34 @@ func (s *Store) Search(ctx context.Context, query string, offset, limit int, exc
 		return []*Paste{}, 0, nil
 	}
 
-	field := "all"
-	value := query
-	if idx := strings.Index(query, ":"); idx > 0 {
-		key := strings.ToLower(strings.TrimSpace(query[:idx]))
-		if key == "title" || key == "content" || key == "tags" {
-			field = key
-			value = strings.TrimSpace(query[idx+1:])
-		}
-	}
-	value = strings.TrimSpace(value)
-	if value == "" {
+	filters := parseSearchQuery(query)
+	if len(filters) == 0 {
 		return []*Paste{}, 0, nil
 	}
-	pattern := "%" + value + "%"
 
-	var (
-		whereClause string
-		whereArgs   []any
-	)
-	switch field {
-	case "title":
-		whereClause = "title LIKE ?"
-		whereArgs = []any{pattern}
-	case "content":
-		whereClause = "content LIKE ?"
-		whereArgs = []any{pattern}
-	case "tags":
-		whereClause = "tags LIKE ?"
-		whereArgs = []any{pattern}
-	default:
-		whereClause = "(title LIKE ? OR content LIKE ? OR tags LIKE ?)"
-		whereArgs = []any{pattern, pattern, pattern}
+	var conditions []string
+	var whereArgs []any
+	for _, f := range filters {
+		switch f.field {
+		case "title":
+			conditions = append(conditions, "title LIKE ?")
+			whereArgs = append(whereArgs, "%"+f.value+"%")
+		case "tags":
+			// 精确标签匹配：覆盖 tag 在逗号分隔列表中的全部 4 种位置
+			//   tags = 'tag'          → 唯一标签
+			//   tags LIKE 'tag,%'     → 位于开头
+			//   tags LIKE '%,tag'     → 位于末尾
+			//   tags LIKE '%,tag,%'   → 位于中间
+			conditions = append(conditions,
+				"(tags = ? OR tags LIKE ? OR tags LIKE ? OR tags LIKE ?)")
+			v := f.value
+			whereArgs = append(whereArgs, v, v+",%", "%,"+v, "%,"+v+",%")
+		default: // "content" 及无前缀 token
+			conditions = append(conditions, "content LIKE ?")
+			whereArgs = append(whereArgs, "%"+f.value+"%")
+		}
 	}
+	whereClause := strings.Join(conditions, " AND ")
 
 	hideSQL := ""
 	if excludeHideTag {
