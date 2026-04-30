@@ -2,18 +2,21 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
+	"image"
+	"image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
+
+	"chore/client"
 
 	"github.com/atotto/clipboard"
 )
@@ -127,31 +130,46 @@ func main() {
 	clientName := clientNameFromExec()
 	baseURL := strings.TrimSuffix(*serverURL, "/")
 	listURL := baseURL + "/list/" + clientName
+	ctx := context.Background()
+	c := client.New(baseURL, clientName)
 
-	// -i: 从服务器按 id 获取并打印内容（或 -c 复制到剪贴板）
+	// -i: 从服务器按 id 获取内容
 	if strings.TrimSpace(*getID) != "" {
-		idStr := strings.TrimSpace(*getID)
-		detailURL := baseURL + "/detail/" + clientName + "/" + idStr
-		req, err := http.NewRequest(http.MethodGet, detailURL, nil)
+		id, err := parseID(strings.TrimSpace(*getID))
 		if err != nil {
-			fail("build request: %v", err)
+			fail("%v", err)
 		}
-		req.Header.Set("Accept", "application/json")
-		resp, err := http.DefaultClient.Do(req)
+		p, err := c.Get(ctx, id)
+		if errors.Is(err, client.ErrNotFound) {
+			fail("id %d not found", id)
+		}
 		if err != nil {
-			fail("request: %v", err)
+			fail("get: %v", err)
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			b, _ := io.ReadAll(resp.Body)
-			fail("server returned %d: %s", resp.StatusCode, string(b))
+
+		if p.HasTag("png") {
+			// 图片记录：从服务器拉取原始字节
+			imgBytes, err := c.FetchImage(ctx, p.Content)
+			if err != nil {
+				fail("fetch image: %v", err)
+			}
+			if *cp {
+				// -c：将图片复制到剪贴板
+				if err := copyImageToClipboard(imgBytes); err != nil {
+					fail("copy image to clipboard: %v", err)
+				}
+				return
+			}
+			// 无 -c：在终端以彩色字符画预览图片
+			img, err := png.Decode(bytes.NewReader(imgBytes))
+			if err != nil {
+				fail("decode image: %v", err)
+			}
+			renderImageToTerminal(img, termWidth())
+			return
 		}
-		var p struct {
-			Content string `json:"content"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
-			fail("decode response: %v", err)
-		}
+
+		// 文字记录
 		if *cp {
 			if err := clipboard.WriteAll(p.Content); err != nil {
 				fail("copy to clipboard: %v", err)
@@ -169,10 +187,16 @@ func main() {
 		return
 	}
 
+	tagsSlice := parseTags(*tags)
+
 	// 尝试读文字剪贴板
 	textContent, textErr := clipboard.ReadAll()
 	if textErr == nil && trimSpace(textContent) != "" {
-		uploadText(baseURL, clientName, *serverURL, trimSpace(textContent), *title, *tags, *verbose)
+		result, err := c.UploadText(ctx, trimSpace(textContent), *title, tagsSlice)
+		if err != nil {
+			fail("upload: %v", err)
+		}
+		printResult(result, *serverURL, *verbose)
 		return
 	}
 
@@ -182,7 +206,11 @@ func main() {
 		fail("read image from clipboard: %v", imgErr)
 	}
 	if imgData != nil {
-		uploadImage(baseURL, clientName, *serverURL, imgData, *title, *tags, *verbose)
+		result, err := c.UploadImage(ctx, imgData, *title, tagsSlice)
+		if err != nil {
+			fail("upload image: %v", err)
+		}
+		printResult(result, *serverURL, *verbose)
 		return
 	}
 
@@ -191,98 +219,88 @@ func main() {
 	fail("clipboard contains unsupported content\nfound: %s", desc)
 }
 
-// uploadText 将文字内容 POST 到 /api/paste 并打印结果。
-func uploadText(baseURL, clientName, serverURL, content, titleFlag, tagsFlag string, verbose bool) {
-	payload := struct {
-		Content string   `json:"content"`
-		Title   string   `json:"title,omitempty"`
-		Tags    []string `json:"tags,omitempty"`
-	}{
-		Content: content,
-		Title:   strings.TrimSpace(titleFlag),
+// ──────────────────────────────────────────────
+// 终端图片渲染
+// ──────────────────────────────────────────────
+
+// renderImageToTerminal 将图片以 24-bit 真彩色字符画输出到终端。
+// 使用 ▄（下半块）配合前景/背景色，每个字符表示 2 行像素，同比例压缩到 maxWidth 列。
+func renderImageToTerminal(img image.Image, maxWidth int) {
+	bounds := img.Bounds()
+	srcW, srcH := bounds.Dx(), bounds.Dy()
+	if srcW == 0 || srcH == 0 {
+		return
 	}
-	if tagsFlag != "" {
-		for _, t := range strings.Split(tagsFlag, ",") {
-			if s := strings.TrimSpace(t); s != "" {
-				payload.Tags = append(payload.Tags, s)
+
+	// 等比缩放：终端字符约 2:1（高:宽），▄ 每字符覆盖 2 行像素，故像素比例不变
+	targetW := srcW
+	if targetW > maxWidth {
+		targetW = maxWidth
+	}
+	targetH := targetW * srcH / srcW
+	if targetH < 2 {
+		targetH = 2
+	}
+	if targetH%2 != 0 {
+		targetH++
+	}
+
+	scaled := resizeNearest(img, targetW, targetH)
+
+	var sb strings.Builder
+	for y := 0; y < targetH; y += 2 {
+		for x := 0; x < targetW; x++ {
+			tr, tg, tb := pixelRGB(scaled, x, y)
+			br, bg, bb := pixelRGB(scaled, x, y+1) // targetH 已保证为偶数
+			// 上半像素 → 背景色，下半像素 → 前景色，▄ 填充下半
+			sb.WriteString(fmt.Sprintf("\x1b[48;2;%d;%d;%dm\x1b[38;2;%d;%d;%dm▄", tr, tg, tb, br, bg, bb))
+		}
+		sb.WriteString("\x1b[0m\n")
+	}
+	fmt.Print(sb.String())
+}
+
+// resizeNearest 使用最近邻算法将图片缩放到指定像素尺寸。
+func resizeNearest(src image.Image, newW, newH int) image.Image {
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+	b := src.Bounds()
+	srcW, srcH := b.Dx(), b.Dy()
+	for y := 0; y < newH; y++ {
+		for x := 0; x < newW; x++ {
+			dst.Set(x, y, src.At(b.Min.X+x*srcW/newW, b.Min.Y+y*srcH/newH))
+		}
+	}
+	return dst
+}
+
+// pixelRGB 返回图片中 (x, y) 处像素的 8-bit RGB 分量。
+func pixelRGB(img image.Image, x, y int) (r, g, b uint8) {
+	b2 := img.Bounds()
+	c := img.At(b2.Min.X+x, b2.Min.Y+y)
+	r16, g16, b16, _ := c.RGBA()
+	return uint8(r16 >> 8), uint8(g16 >> 8), uint8(b16 >> 8)
+}
+
+// termWidth 返回终端列数，优先读取 COLUMNS 环境变量，其次 tput cols，最后默认 80。
+func termWidth() int {
+	if col := os.Getenv("COLUMNS"); col != "" {
+		if n, _ := strconv.Atoi(col); n > 10 {
+			return n
+		}
+	}
+	if runtime.GOOS != "windows" {
+		if out, err := exec.Command("tput", "cols").Output(); err == nil {
+			if n, _ := strconv.Atoi(strings.TrimSpace(string(out))); n > 10 {
+				return n
 			}
 		}
 	}
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/paste", bytes.NewReader(body))
-	if err != nil {
-		fail("build request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Client-Name", clientName)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fail("request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		fail("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	printUploadResult(resp.Body, serverURL, verbose)
+	return 80
 }
 
-// uploadImage 将 PNG 字节 POST 到 /api/image 并打印结果。
-func uploadImage(baseURL, clientName, serverURL string, imgData []byte, titleFlag, tagsFlag string, verbose bool) {
-	endpoint := baseURL + "/api/image"
-	params := url.Values{}
-	if t := strings.TrimSpace(titleFlag); t != "" {
-		params.Set("title", t)
-	}
-	if tagsFlag != "" {
-		params.Set("tags", tagsFlag)
-	}
-	if len(params) > 0 {
-		endpoint += "?" + params.Encode()
-	}
-
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(imgData))
-	if err != nil {
-		fail("build image request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Client-Name", clientName)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fail("image upload request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		fail("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	printUploadResult(resp.Body, serverURL, verbose)
-}
-
-// printUploadResult 解析上传响应并在 verbose 模式下打印详情。
-func printUploadResult(body io.Reader, serverURL string, verbose bool) {
-	var out struct {
-		ID        int64  `json:"id"`
-		CreatedAt string `json:"created_at"`
-		DetailURL string `json:"detail_url"`
-		ListURL   string `json:"list_url"`
-	}
-	if err := json.NewDecoder(body).Decode(&out); err != nil {
-		fail("decode response: %v", err)
-	}
-	if !verbose {
-		return
-	}
-	fmt.Printf("saved #%d %s\n", out.ID, out.CreatedAt)
-	fmt.Printf("detail: %s%s\n", serverURL, out.DetailURL)
-	if out.ListURL != "" {
-		fmt.Printf("list: %s%s\n", serverURL, out.ListURL)
-	}
-}
+// ──────────────────────────────────────────────
+// 剪贴板：读取图片
+// ──────────────────────────────────────────────
 
 // readClipboardImage 尝试从剪贴板读取 PNG 图片字节。
 // 返回 (nil, nil) 表示剪贴板中没有图片（不是错误）。
@@ -292,6 +310,8 @@ func readClipboardImage() ([]byte, error) {
 		return readClipboardImageMac()
 	case "linux":
 		return readClipboardImageLinux()
+	case "windows":
+		return readClipboardImageWindows()
 	default:
 		return nil, nil
 	}
@@ -312,7 +332,7 @@ on error
 end try`
 	out, err := exec.Command("osascript", "-e", script).Output()
 	if err != nil {
-		return nil, nil // osascript 不可用，当作无图片
+		return nil, nil
 	}
 	if strings.TrimSpace(string(out)) != "ok" {
 		return nil, nil
@@ -321,7 +341,7 @@ end try`
 	return os.ReadFile(tmpFile)
 }
 
-// readClipboardImageLinux 尝试用 xclip 读取剪贴板中的 PNG。
+// readClipboardImageLinux 用 xclip 读取剪贴板中的 PNG。
 func readClipboardImageLinux() ([]byte, error) {
 	out, err := exec.Command("xclip", "-selection", "clipboard", "-t", "image/png", "-o").Output()
 	if err != nil || len(out) == 0 {
@@ -330,7 +350,88 @@ func readClipboardImageLinux() ([]byte, error) {
 	return out, nil
 }
 
-// describeClipboard 返回剪贴板当前内容类型的描述，用于不支持的内容类型的错误提示。
+// readClipboardImageWindows 用 PowerShell 将剪贴板图片保存为 PNG 后读取。
+func readClipboardImageWindows() ([]byte, error) {
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("chore_clip_%d.png", time.Now().UnixNano()))
+	// 用单引号包裹路径；单引号字符用 '' 转义
+	escapedPath := strings.ReplaceAll(tmpFile, "'", "''")
+	script := fmt.Sprintf(`
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$img = [System.Windows.Forms.Clipboard]::GetImage()
+if ($img -ne $null) {
+    $img.Save('%s', [System.Drawing.Imaging.ImageFormat]::Png)
+    $img.Dispose()
+    Write-Output 'ok'
+} else {
+    Write-Output 'no'
+}`, escapedPath)
+	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
+	if err != nil {
+		return nil, nil
+	}
+	if strings.TrimSpace(string(out)) != "ok" {
+		return nil, nil
+	}
+	defer os.Remove(tmpFile)
+	return os.ReadFile(tmpFile)
+}
+
+// ──────────────────────────────────────────────
+// 剪贴板：写入图片
+// ──────────────────────────────────────────────
+
+// copyImageToClipboard 将 PNG 字节写入系统剪贴板。
+func copyImageToClipboard(data []byte) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return copyImageToClipboardMac(data)
+	case "linux":
+		return copyImageToClipboardLinux(data)
+	case "windows":
+		return copyImageToClipboardWindows(data)
+	default:
+		return fmt.Errorf("copy image to clipboard not supported on %s", runtime.GOOS)
+	}
+}
+
+func copyImageToClipboardMac(data []byte) error {
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("chore_paste_%d.png", time.Now().UnixNano()))
+	if err := os.WriteFile(tmpFile, data, 0o600); err != nil {
+		return err
+	}
+	defer os.Remove(tmpFile)
+	script := `set the clipboard to (read (POSIX file "` + tmpFile + `") as «class PNGf»)`
+	return exec.Command("osascript", "-e", script).Run()
+}
+
+func copyImageToClipboardLinux(data []byte) error {
+	cmd := exec.Command("xclip", "-selection", "clipboard", "-t", "image/png")
+	cmd.Stdin = bytes.NewReader(data)
+	return cmd.Run()
+}
+
+func copyImageToClipboardWindows(data []byte) error {
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("chore_paste_%d.png", time.Now().UnixNano()))
+	if err := os.WriteFile(tmpFile, data, 0o600); err != nil {
+		return err
+	}
+	defer os.Remove(tmpFile)
+	escapedPath := strings.ReplaceAll(tmpFile, "'", "''")
+	script := fmt.Sprintf(`
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$img = [System.Drawing.Image]::FromFile('%s')
+[System.Windows.Forms.Clipboard]::SetImage($img)
+$img.Dispose()`, escapedPath)
+	return exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Run()
+}
+
+// ──────────────────────────────────────────────
+// 剪贴板信息
+// ──────────────────────────────────────────────
+
+// describeClipboard 返回剪贴板当前内容类型的描述，用于不支持内容的错误提示。
 func describeClipboard() string {
 	switch runtime.GOOS {
 	case "darwin":
@@ -346,6 +447,45 @@ func describeClipboard() string {
 	default:
 		return fmt.Sprintf("unknown (unsupported platform: %s)", runtime.GOOS)
 	}
+}
+
+// ──────────────────────────────────────────────
+// 辅助函数
+// ──────────────────────────────────────────────
+
+// printResult 在 verbose 模式下打印上传结果。
+func printResult(r *client.UploadResult, serverURL string, verbose bool) {
+	if !verbose {
+		return
+	}
+	fmt.Printf("saved #%d %s\n", r.ID, r.CreatedAt)
+	fmt.Printf("detail: %s%s\n", serverURL, r.DetailURL)
+	if r.ListURL != "" {
+		fmt.Printf("list: %s%s\n", serverURL, r.ListURL)
+	}
+}
+
+// parseTags 将逗号分隔的标签字符串解析为切片。
+func parseTags(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, t := range strings.Split(s, ",") {
+		if v := strings.TrimSpace(t); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// parseID 将字符串解析为正整数 id。
+func parseID(s string) (int64, error) {
+	var id int64
+	if _, err := fmt.Sscanf(s, "%d", &id); err != nil || id <= 0 {
+		return 0, fmt.Errorf("invalid id %q: must be a positive integer", s)
+	}
+	return id, nil
 }
 
 // fail prints to stderr and exits
