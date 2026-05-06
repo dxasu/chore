@@ -12,8 +12,8 @@ import (
 	"strconv"
 	"strings"
 
-	"chore/internal/server"
-	"chore/internal/store"
+	"github.com/dxasu/chore/internal/server"
+	"github.com/dxasu/chore/internal/store"
 	"github.com/atotto/clipboard"
 )
 

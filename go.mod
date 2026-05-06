@@ -1,4 +1,4 @@
-module chore
+module github.com/dxasu/chore
 
 go 1.21
 

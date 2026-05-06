@@ -1,6 +1,6 @@
 // Package client 是 chore_svr HTTP API 的 Go 客户端封装。
 //
-// 其他程序通过 import "chore/client" 即可直接调用，无需手动处理 HTTP 细节：
+// 其他程序通过 import "github.com/dxasu/chore/client" 即可直接调用，无需手动处理 HTTP 细节：
 //
 //	c := client.New("http://localhost:2026", "myapp")
 //
@@ -21,6 +21,11 @@
 // 自定义超时示例：
 //
 //	c := client.New(url, name).WithHTTPClient(&http.Client{Timeout: 5 * time.Second})
+//
+// 若需要在 Get/List/Search 的 JSON 响应中看到含 safe 标签记录的完整正文，
+// 使用 WithShowSafe 选项（默认情况下服务端对 safe 记录的 content 置空）：
+//
+//	c := client.New(url, name, client.WithShowSafe())
 package client
 
 import (
@@ -103,17 +108,25 @@ type Client struct {
 	baseURL    string       // 服务端地址，不含尾部斜线
 	clientName string       // 客户端名（对应服务端数据库名，如 "myapp" → myapp.db）
 	httpClient *http.Client // 可通过 WithHTTPClient 替换
+	showSafe   bool         // 是否显示 safe 标签的记录
 }
 
 // New 创建 Client。
 // baseURL 为服务端地址（如 "http://localhost:2026"）；
 // clientName 为客户端名，决定服务端使用哪个数据库（同 chore 可执行文件名约定）。
 func New(baseURL, clientName string) *Client {
-	return &Client{
+	c := &Client{
 		baseURL:    strings.TrimSuffix(baseURL, "/"),
 		clientName: clientName,
 		httpClient: http.DefaultClient,
 	}
+	return c
+}
+
+// WithShowSafe 设置显示 safe 标签的记录。
+func (c *Client) WithShowSafe() *Client {
+	c.showSafe = true
+	return c
 }
 
 // WithHTTPClient 替换内部使用的 *http.Client，返回自身以支持链式调用。
@@ -214,6 +227,7 @@ func (c *Client) Update(ctx context.Context, id int64, title *string, tags *[]st
 
 // Get 按 id 查询单条记录（GET /detail/:name/:id，Accept: application/json）。
 // 含 hide 标签的记录对 HTTP 不可见，与不存在的记录同样返回 ErrNotFound。
+// 若 Client 以 WithShowSafe() 选项创建，含 safe 标签的记录也会返回完整 content。
 func (c *Client) Get(ctx context.Context, id int64) (*Paste, error) {
 	endpoint := fmt.Sprintf("%s/detail/%s/%d", c.baseURL, c.clientName, id)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -221,6 +235,9 @@ func (c *Client) Get(ctx context.Context, id int64) (*Paste, error) {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
+	if c.showSafe {
+		req.Header.Set("X-Show-Safe", "true")
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -243,13 +260,15 @@ func (c *Client) Get(ctx context.Context, id int64) (*Paste, error) {
 
 // List 分页获取历史记录（GET /list/:name，按 created_at 倒序）。
 // page 从 1 开始；perPage 最大 100，超出服务端会截断；传 0 使用服务端默认值（20）。
+// 若 Client 以 WithShowSafe() 选项创建，含 safe 标签的记录也会返回完整 content。
 func (c *Client) List(ctx context.Context, page, perPage int) (*ListResult, error) {
 	return c.query(ctx, "", page, perPage)
 }
 
 // Search 按关键词搜索记录（GET /list/:name?q=...），搜索范围覆盖 title、content、tags。
-// 支持字段前缀语法：title:xxx、content:xxx、tags:xxx。
+// 支持字段前缀语法：title:xxx、content:xxx、tags:xxx（无前缀匹配 content）。
 // page 从 1 开始；perPage 最大 20（服务端搜索上限）。
+// 若 Client 以 WithShowSafe() 选项创建，含 safe 标签的记录也会返回完整 content。
 func (c *Client) Search(ctx context.Context, query string, page, perPage int) (*ListResult, error) {
 	return c.query(ctx, query, page, perPage)
 }
@@ -319,6 +338,9 @@ func (c *Client) query(ctx context.Context, q string, page, perPage int) (*ListR
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
+	if c.showSafe {
+		req.Header.Set("X-Show-Safe", "true")
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

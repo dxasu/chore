@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"chore/client"
+	"github.com/dxasu/chore/client"
 
 	"github.com/atotto/clipboard"
 )

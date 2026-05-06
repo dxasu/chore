@@ -31,7 +31,7 @@ import (
 	"strings"
 	"time"
 
-	"chore/internal/store"
+	"github.com/dxasu/chore/internal/store"
 )
 
 // previewLen 是列表页「内容预览」列截取的最大 Unicode 字符数。
@@ -423,7 +423,10 @@ func (s *Server) HandleList(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(accept, "application/json") {
 		w.Header().Set("Content-Type", "application/json")
 		totalPages := (int(total) + perPage - 1) / perPage
-		items := redactSafeContentCopies(list)
+		items := list
+		if r.Header.Get("X-Show-Safe") != "true" {
+			items = redactSafeContentCopies(list)
+		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"items":       items,
 			"total":       total,
@@ -495,7 +498,11 @@ func (s *Server) HandleDetail(w http.ResponseWriter, r *http.Request) {
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "application/json") {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(redactSafePasteForHTTP(p))
+		out := p
+		if r.Header.Get("X-Show-Safe") != "true" {
+			out = redactSafePasteForHTTP(p)
+		}
+		json.NewEncoder(w).Encode(out)
 		return
 	}
 

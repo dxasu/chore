@@ -12,7 +12,7 @@
 // safe 标签（访问控制）由 detailPage 在进入注册表之前提前处理，与格式渲染解耦。
 package server
 
-import "chore/internal/store"
+import "github.com/dxasu/chore/internal/store"
 
 // detailBodyFragment 封装详情页「正文区」所需的全部可变片段。
 // detailPage 将这些字段嵌入固定的 HTML 页面框架中，自身不包含格式判断逻辑。
