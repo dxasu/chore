@@ -33,7 +33,7 @@ var (
 
 // expandShortArgs expands combined short flags.
 // Supports:
-// - bool-only cluster: -voc -> -v -o -c
+// - bool-only cluster: -vwc -> -v -w -c
 // - one value flag mixed with bool flags: -icv 1 -> -c -v -i 1
 func expandShortArgs(args []string, boolFlags, valueFlags map[rune]bool) []string {
 	if len(args) <= 1 {
@@ -98,9 +98,10 @@ func printVersion() {
 func main() {
 	serverURL := flag.String("s", defaultServerURL, "chore_svr server URL")
 	verbose := flag.Bool("v", false, "on success print detail and list URLs")
-	openList := flag.Bool("o", false, "do not send; open browser to list page only")
+	openList := flag.Bool("w", false, "do not send; open browser to list page only")
 	getID := flag.String("i", "", "paste id to fetch and print")
-	cp := flag.Bool("c", false, "with -i: copy content to clipboard instead of stdout")
+	nth := flag.Int("n", 0, "get the nth latest visible record (1=latest), print id and full content")
+	cp := flag.Bool("c", false, "with -i/-n: copy content to clipboard instead of stdout")
 	title := flag.String("title", "", "optional title for the paste")
 	tags := flag.String("tags", "", "optional comma-separated tags (max 10)")
 	version := flag.Bool("version", false, "print build info and exit")
@@ -108,14 +109,15 @@ func main() {
 		name := clientNameFromExec()
 		fmt.Fprintf(os.Stderr, "%s - send clipboard to chore_svr, one DB per executable name (e.g. abc -> abc.db)\n\nUsage:\n  %s [options]\n\nOptions:\n", name, name)
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nExamples:\n  %s                 read clipboard and upload (text or image)\n  %s -v              print detail URL and list URL\n  %s -o              open browser to list page\n  %s -i 5            get and print content of paste #5\n  %s -i 5 -c         get content of paste #5 and copy it\n  %s -vc             combined short bool flags (equivalent to -v -c)\n  %s -icv 5          mixed short flags (equivalent to -c -v -i 5)\n  %s -title \"Note\" -tags a,b,c  upload with optional title and tags\n  %s -s http://host:9000         use custom server\n", name, name, name, name, name, name, name, name, name)
+		fmt.Fprintf(os.Stderr, "\nExamples:\n  %s                 read clipboard and upload (text or image)\n  %s -v              print detail URL and list URL\n  %s -w              open browser to list page\n  %s -i 5            get and print content of paste #5\n  %s -i 5 -c         get content of paste #5 and copy it\n  %s -n 1            get the latest visible record (print id and content)\n  %s -n 2 -c         get the 2nd latest visible record and copy it\n  %s -vc             combined short bool flags (equivalent to -v -c)\n  %s -icv 5          mixed short flags (equivalent to -c -v -i 5)\n  %s -title \"Note\" -tags a,b,c  upload with optional title and tags\n  %s -s http://host:9000         use custom server\n", name, name, name, name, name, name, name, name, name, name, name)
 	}
 	expandedArgs := expandShortArgs(os.Args, map[rune]bool{
 		'v': true,
-		'o': true,
+		'w': true,
 		'c': true,
 	}, map[rune]bool{
 		'i': true,
+		'n': true,
 		's': true,
 	})
 	if err := flag.CommandLine.Parse(expandedArgs[1:]); err != nil {
@@ -131,7 +133,7 @@ func main() {
 	baseURL := strings.TrimSuffix(*serverURL, "/")
 	listURL := baseURL + "/list/" + clientName
 	ctx := context.Background()
-	c := client.New(baseURL, clientName)
+	c := client.New(baseURL, clientName).WithShowSafe()
 
 	// -i: 从服务器按 id 获取内容
 	if strings.TrimSpace(*getID) != "" {
@@ -177,6 +179,47 @@ func main() {
 			return
 		}
 		fmt.Print(p.Content)
+		return
+	}
+
+	// -n: 获取最新可见的第 n 条记录（hide 标签不可见）
+	if *nth > 0 {
+		result, err := c.List(ctx, *nth, 1)
+		if err != nil {
+			fail("list: %v", err)
+		}
+		if len(result.Items) == 0 {
+			fail("no visible record at position %d", *nth)
+		}
+		p := result.Items[0]
+
+		if p.HasTag("png") {
+			imgBytes, err := c.FetchImage(ctx, p.Content)
+			if err != nil {
+				fail("fetch image: %v", err)
+			}
+			if *cp {
+				if err := copyImageToClipboard(imgBytes); err != nil {
+					fail("copy image to clipboard: %v", err)
+				}
+				return
+			}
+			fmt.Printf("#%d\n", p.ID)
+			img, err := png.Decode(bytes.NewReader(imgBytes))
+			if err != nil {
+				fail("decode image: %v", err)
+			}
+			renderImageToTerminal(img, termWidth())
+			return
+		}
+
+		if *cp {
+			if err := clipboard.WriteAll(p.Content); err != nil {
+				fail("copy to clipboard: %v", err)
+			}
+			return
+		}
+		fmt.Printf("#%d\n%s\n", p.ID, p.Content)
 		return
 	}
 

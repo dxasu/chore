@@ -135,11 +135,12 @@ func main() {
 	name := flag.String("name", "", "DB name (optional). Fallback order: -name > chore.json:name > service name")
 	idArg := flag.String("i", "", "get/update/delete by id; delete requires -delete (supports 1-4,7,10)")
 	deleteMode := flag.Bool("delete", false, "with -i: delete records by id list/range")
-	cp := flag.Bool("c", false, "with -i get mode: copy content to clipboard instead of stdout")
+	cp := flag.Bool("c", false, "with -i/-n get mode: copy content to clipboard instead of stdout")
 	title := flag.String("title", "", "with -i: set title (update mode, single id)")
 	tags := flag.String("tags", "", "with -i: set tags, comma-separated (update mode, single id)")
 	q := flag.String("q", "", "local search by content and print, then exit")
 	limit := flag.Int("limit", 0, "with -q: max results; without -q: show last N items")
+	nth := flag.Int("n", 0, "get the nth latest record (1=latest), print id and full content; use with -c to copy")
 	version := flag.Bool("version", false, "print build info and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `chore_svr - receive paste from chore, store per-client sqlite; or use as local delete/search/list/update tool
@@ -147,6 +148,7 @@ func main() {
 Usage:
   Start server (default)   chore_svr [-addr :2026] [-dbDir ./]
   Get content by id        chore_svr [-name <dbname>] -i <id> [-c]
+  Get nth latest record    chore_svr [-name <dbname>] -n <N> [-c]   (1=latest)
   Local delete             chore_svr [-name <dbname>] -i <1-4,7,10> -delete
   Local update             chore_svr [-name <dbname>] -i <single-id> [-title "x"] [-tags "a,b"]
   Local search & print     chore_svr [-name <dbname>] -q "keyword" [-limit 20]
@@ -184,6 +186,29 @@ API when running as server (no -i/-q/-limit):
 
 	manager := store.NewManager(*dbDir)
 	defer manager.Close()
+
+	if *nth > 0 {
+		st, err := manager.GetStore(resolvedName)
+		if err != nil {
+			log.Fatalf("open DB %s: %v", resolvedName, err)
+		}
+		list, _, err := st.List(context.Background(), *nth-1, 1, false)
+		if err != nil {
+			log.Fatalf("list: %v", err)
+		}
+		if len(list) == 0 {
+			log.Fatalf("no record at position %d", *nth)
+		}
+		p := list[0]
+		if cpValue {
+			if err := clipboard.WriteAll(p.Content); err != nil {
+				log.Fatalf("copy to clipboard: %v", err)
+			}
+			return
+		}
+		fmt.Printf("#%d\n%s\n", p.ID, p.Content)
+		return
+	}
 
 	if idValue != "" {
 		ids, err := parseIDs(idValue)

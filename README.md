@@ -41,11 +41,13 @@ chore [选项]
 
   -s <url>          服务端地址，默认 http://localhost:2026
   -v                上传成功后打印详情 URL 与列表 URL
-  -o                不上传，直接用浏览器打开列表页
+  -w                不上传，直接用浏览器打开列表页
   -i <id>           按 id 获取内容并打印到 stdout
                     若该记录为图片（含 png 标签），在终端渲染 24-bit 彩色字符画预览
   -i <id> -c        按 id 获取内容并复制到剪贴板
                     若该记录为图片，复制图片原始字节（而非路径文字）
+  -n <N>            获取最新可见的第 N 条记录（1=最新），打印 id 和完整内容
+  -n <N> -c         获取第 N 条记录并复制到剪贴板（图片则复制图片字节）
   -title <text>     上传时指定标题
   -tags <a,b,c>     上传时指定标签（逗号分隔，最多 10 个）
   -version          打印编译时间、commit id 与 git tag（如有）后退出
@@ -75,10 +77,13 @@ chore [选项]
 ```bash
 chore                          # 上传剪贴板（文字或图片自动识别）
 chore -v                       # 上传并打印 URL
+chore -w                       # 不上传，用浏览器打开列表页
 chore -vc                      # 上传、打印 URL
 chore -i 5                     # 获取 #5 并打印（图片则终端预览）
 chore -i 5 -c                  # 获取 #5 并复制到剪贴板（图片则复制图片字节）
 chore -icv 5                   # 获取 #5、复制、打印 URL
+chore -n 1                     # 获取最新可见记录（打印 id 和内容）
+chore -n 2 -c                  # 获取第 2 新记录并复制
 chore -title "今日笔记" -tags md,safe   # 上传并指定标题与标签
 chore -s http://host:9000      # 指定自定义服务端
 chore -version                 # 打印版本信息
